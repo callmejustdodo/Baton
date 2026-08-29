@@ -1,6 +1,6 @@
 # Baton : you can close your macbook now
 
-We need to keep our MacBook open in agent era. Before Baton.
+We need to keep our MacBook open in agent era. **Before Baton.**
 
 ![A laptop hands off an in-progress agent session to the cloud](assets/baton-handoff.png)
 
