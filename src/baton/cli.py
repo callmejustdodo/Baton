@@ -5,10 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
+from uuid import UUID
 
-from .fetch import FetchError, fetch_workspace, write_handoff_receipt
+from .fetch import (
+    FetchError,
+    fetch_workspace,
+    list_handoff_receipts,
+    write_handoff_receipt,
+)
 from .handoff import (
     DEFAULT_MODAL_APP,
     DEFAULT_MODAL_SECRET,
@@ -17,6 +24,13 @@ from .handoff import (
     image_name_for_version,
     infer_local_codex_version,
     prepare_runtime,
+)
+from .picker import (
+    PickerCancelled,
+    PickerError,
+    choose_handoff,
+    choose_session,
+    list_local_sessions,
 )
 from .snapshot import SnapshotError, snapshot
 
@@ -73,8 +87,18 @@ def build_parser() -> argparse.ArgumentParser:
         "handoff",
         help="snapshot a session and resume it in a Modal Sandbox",
     )
-    handoff_parser.add_argument("session_id", help="Codex session UUID to resume")
-    handoff_parser.add_argument("follow_up_prompt", help="prompt to resume with")
+    handoff_parser.add_argument(
+        "session_or_prompt",
+        help=(
+            "Codex session UUID when followed by a prompt; otherwise the prompt and "
+            "Baton opens a session picker"
+        ),
+    )
+    handoff_parser.add_argument(
+        "follow_up_prompt",
+        nargs="?",
+        help="prompt to resume with when a session UUID is supplied",
+    )
     handoff_parser.add_argument(
         "--workspace",
         type=Path,
@@ -125,7 +149,11 @@ def build_parser() -> argparse.ArgumentParser:
         "fetch",
         help="download a completed Modal Sandbox workspace for safe local review",
     )
-    fetch_parser.add_argument("sandbox_id", help="Modal Sandbox object ID to fetch")
+    fetch_parser.add_argument(
+        "sandbox_id",
+        nargs="?",
+        help="Modal Sandbox object ID to fetch (omit to open a handoff picker)",
+    )
     fetch_parser.add_argument(
         "--workspace",
         type=Path,
@@ -177,8 +205,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "handoff":
         try:
+            session_id, follow_up_prompt = _resolve_handoff_selection(args)
             snapshot_result = snapshot(
-                session_id=args.session_id,
+                session_id=session_id,
                 workspace=args.workspace,
                 codex_home=args.codex_home,
                 output=args.output,
@@ -186,7 +215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             image_name = args.image_name or image_name_for_version(infer_local_codex_version())
             result = handoff_archive(
                 archive_path=snapshot_result.path,
-                prompt=args.follow_up_prompt,
+                prompt=follow_up_prompt,
                 app_name=args.app_name,
                 modal_secret=args.secret_name,
                 image_name=image_name,
@@ -203,7 +232,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     archive_path=snapshot_result.path,
                     workspace=args.workspace,
                 )
-        except (SnapshotError, HandoffError, FetchError) as error:
+        except PickerCancelled:
+            print("Baton: selection cancelled", file=sys.stderr)
+            return 130
+        except (SnapshotError, HandoffError, FetchError, PickerError) as error:
             parser.error(str(error))
         payload = {"type": "handoff_complete", **result.to_dict()}
         if receipt_path is not None:
@@ -213,13 +245,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "fetch":
         try:
+            sandbox_id, receipt_path = _resolve_fetch_selection(args)
             result = fetch_workspace(
-                sandbox_id=args.sandbox_id,
+                sandbox_id=sandbox_id,
                 workspace=args.workspace,
-                receipt_path=args.receipt,
+                receipt_path=receipt_path,
                 output=args.output,
             )
-        except FetchError as error:
+        except PickerCancelled:
+            print("Baton: selection cancelled", file=sys.stderr)
+            return 130
+        except (FetchError, PickerError) as error:
             parser.error(str(error))
         print(json.dumps({"type": "fetch_complete", **result.to_dict()}, sort_keys=True))
         return 0
@@ -230,6 +266,41 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _print_handoff_event(event: dict[str, object]) -> None:
     print(json.dumps(event, sort_keys=True), flush=True)
+
+
+def _resolve_handoff_selection(args: argparse.Namespace) -> tuple[str, str]:
+    """Interpret one positional handoff argument as picker mode."""
+
+    if args.follow_up_prompt is not None:
+        return args.session_or_prompt, args.follow_up_prompt
+    if _looks_like_uuid(args.session_or_prompt):
+        raise PickerError(
+            "a session ID needs a follow-up prompt; use "
+            "'baton handoff <session-id> <prompt>'"
+        )
+    choice = choose_session(
+        list_local_sessions(codex_home=args.codex_home, workspace=args.workspace)
+    )
+    return choice.session_id, args.session_or_prompt
+
+
+def _resolve_fetch_selection(args: argparse.Namespace) -> tuple[str, Path | None]:
+    """Use a receipt picker only when the Sandbox ID was omitted."""
+
+    if args.sandbox_id is not None:
+        return args.sandbox_id, args.receipt
+    if args.receipt is not None:
+        raise FetchError("--receipt requires an explicit Sandbox ID")
+    receipt = choose_handoff(list_handoff_receipts(workspace=args.workspace))
+    return receipt.sandbox_id, receipt.path
+
+
+def _looks_like_uuid(value: str) -> bool:
+    try:
+        UUID(value)
+    except ValueError:
+        return False
+    return True
 
 
 if __name__ == "__main__":

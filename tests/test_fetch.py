@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from baton.fetch import FetchError, fetch_workspace
+from baton.fetch import FetchError, fetch_workspace, list_handoff_receipts
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
 SANDBOX_ID = "sb-fetch-test"
@@ -54,6 +54,15 @@ class FetchTests(unittest.TestCase):
             )
 
         self.assertEqual(modal.Sandbox.from_id_calls, [])
+
+    def test_list_handoff_receipts_skips_symlinked_receipts(self) -> None:
+        linked_receipt = self.receipt.parent / "sb-linked-receipt.json"
+        linked_receipt.symlink_to(self.receipt)
+
+        receipts = list_handoff_receipts(workspace=self.workspace)
+
+        self.assertEqual([receipt.sandbox_id for receipt in receipts], [SANDBOX_ID])
+        self.assertEqual(receipts[0].path, self.receipt.resolve())
 
     def test_missing_completion_marker_is_rejected_before_download(self) -> None:
         modal = _FakeModal({"workspace/app.py": b"ignored\n"}, marker=None)

@@ -112,6 +112,39 @@ def write_handoff_receipt(
     return receipt_path
 
 
+def list_handoff_receipts(*, workspace: Path) -> tuple[HandoffReceipt, ...]:
+    """Return valid detached-handoff receipts for a workspace, newest first."""
+
+    source_workspace = _existing_directory(workspace, "workspace")
+    receipts_directory = _workspace_state_path(
+        source_workspace,
+        HANDOFF_RECEIPTS_DIRECTORY,
+    )
+    if not receipts_directory.is_dir():
+        return ()
+
+    receipts: list[tuple[int, HandoffReceipt]] = []
+    for receipt_path in receipts_directory.glob("*.json"):
+        try:
+            if receipt_path.is_symlink():
+                continue
+            sandbox_id = _normalize_sandbox_id(receipt_path.stem)
+            receipt = _load_handoff_receipt(receipt_path, sandbox_id)
+            modified_at = receipt_path.stat().st_mtime_ns
+        except (FetchError, OSError):
+            continue
+        if receipt.workspace == source_workspace:
+            receipts.append((modified_at, receipt))
+    return tuple(
+        receipt
+        for _, receipt in sorted(
+            receipts,
+            key=lambda entry: (entry[0], entry[1].sandbox_id),
+            reverse=True,
+        )
+    )
+
+
 def fetch_workspace(
     *,
     sandbox_id: str,
