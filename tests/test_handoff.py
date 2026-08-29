@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import subprocess
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from baton.handoff import (
     REMOTE_ARCHIVE,
@@ -20,10 +22,11 @@ from baton.handoff import (
     REMOTE_WORKSPACE,
     HandoffError,
     _capture_remote_git_state,
-    _runtime_image,
+    blueprint_name_for_version,
     build_resume_command,
     handoff_archive,
     inspect_snapshot_archive,
+    prepare_runtime,
 )
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
@@ -63,7 +66,7 @@ class HandoffTests(unittest.TestCase):
             ],
         )
 
-    def test_inspect_archive_rejects_path_traversal_before_modal_is_used(self) -> None:
+    def test_inspect_archive_rejects_path_traversal_before_runloop_is_used(self) -> None:
         self._write_archive(self.archive, extra_members={"../outside.txt": b"nope"})
 
         with self.assertRaisesRegex(HandoffError, "escapes its root"):
@@ -95,62 +98,75 @@ class HandoffTests(unittest.TestCase):
                     inspect_snapshot_archive(self.archive)
 
     def test_handoff_uploads_restores_and_streams_json_events(self) -> None:
-        modal = _FakeModal()
+        runloop = _FakeRunloopClient()
         events: list[dict[str, object]] = []
 
         result = handoff_archive(
             archive_path=self.archive,
             prompt="continue the task",
-            modal_secret="baton-openai",
-            app_name="baton",
-            image_name="baton-codex-0-147-0",
+            runloop_secret="baton-openai",
+            blueprint_name="baton-codex-0-147-0",
             on_event=events.append,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
-        sandbox = modal.sandbox
-        self.assertEqual(result.sandbox_id, "sb-test")
+        devbox = runloop.devbox
+        self.assertEqual(result.devbox_id, "dbx-test")
         self.assertEqual(result.event_count, 2)
-        self.assertEqual(modal.app_lookup_calls, [("baton", True)])
         self.assertEqual(
-            modal.secret_calls,
-            [("baton-openai", ("OPENAI_API_KEY",))],
+            runloop.create_calls,
+            [
+                {
+                    "blueprint_name": "baton-codex-0-147-0",
+                    "name": f"baton-{SESSION_ID[:8]}",
+                    "secrets": {"OPENAI_API_KEY": "baton-openai"},
+                    "launch_parameters": {
+                        "architecture": "x86_64",
+                        "keep_alive_time_seconds": 1200,
+                    },
+                    "metadata": {"baton": "handoff"},
+                }
+            ],
         )
-        self.assertEqual(sandbox.filesystem.copies, [(self.archive.resolve(), REMOTE_ARCHIVE)])
-        self.assertTrue(sandbox.terminated)
-        self.assertTrue(sandbox.detached)
+        self.assertEqual(devbox.filesystem.copies, [(self.archive.resolve(), REMOTE_ARCHIVE)])
+        self.assertTrue(devbox.terminated)
         self.assertEqual(events[0]["type"], "codex_event")
         self.assertEqual(events[1]["type"], "codex_event")
 
-        commands = [command for command, _ in sandbox.commands]
-        auth_index = next(index for index, command in enumerate(commands) if command[0] == "sh")
+        commands = [command for command, _ in devbox.commands]
+        auth_index = next(
+            index
+            for index, command in enumerate(commands)
+            if command[:5]
+            == ("sudo", "-n", "--preserve-env=OPENAI_API_KEY", "sh", "-c")
+        )
         resume_index = next(
             index
             for index, command in enumerate(commands)
             if command[:6]
             == (
-                "runuser",
-                "--user",
+                "sudo",
+                "-n",
+                "-u",
                 REMOTE_RUNTIME_USER,
-                "--preserve-environment",
                 "--",
                 "env",
             )
         )
         self.assertLess(auth_index, resume_index)
         auth_command = commands[auth_index]
-        self.assertIn("$OPENAI_API_KEY", auth_command[2])
-        self.assertIn("CODEX_HOME=/baton/.codex", auth_command[2])
-        self.assertIn("codex login --with-api-key", auth_command[2])
+        self.assertIn("$OPENAI_API_KEY", auth_command[5])
+        self.assertIn("CODEX_HOME=/baton/.codex", auth_command[5])
+        self.assertIn("codex login --with-api-key", auth_command[5])
 
         resume = commands[resume_index]
         self.assertEqual(
             resume,
             (
-                "runuser",
-                "--user",
+                "sudo",
+                "-n",
+                "-u",
                 REMOTE_RUNTIME_USER,
-                "--preserve-environment",
                 "--",
                 "env",
                 "HOME=/home/baton-agent",
@@ -168,22 +184,21 @@ class HandoffTests(unittest.TestCase):
             ),
         )
 
-    def test_handoff_failure_cleans_up_the_sandbox(self) -> None:
-        modal = _FakeModal(resume_returncode=2, resume_stderr="bad API key")
+    def test_handoff_failure_cleans_up_the_devbox(self) -> None:
+        runloop = _FakeRunloopClient(resume_returncode=2, resume_stderr="bad API key")
 
         with self.assertRaisesRegex(HandoffError, "remote Codex resume failed"):
             handoff_archive(
                 archive_path=self.archive,
                 prompt="continue the task",
-                image_name="baton-codex-0-147-0",
-                modal_module=modal,
+                blueprint_name="baton-codex-0-147-0",
+                runloop_client=runloop,
             )
 
-        self.assertTrue(modal.sandbox.terminated)
-        self.assertTrue(modal.sandbox.detached)
+        self.assertTrue(runloop.devbox.terminated)
 
     def test_handoff_buffers_split_and_combined_jsonl_chunks(self) -> None:
-        modal = _FakeModal(
+        runloop = _FakeRunloopClient(
             resume_stdout=[
                 '{"type":"thread.',
                 'started"}\n{"type":"turn.completed"}\n',
@@ -194,9 +209,9 @@ class HandoffTests(unittest.TestCase):
         result = handoff_archive(
             archive_path=self.archive,
             prompt="continue the task",
-            image_name="baton-codex-0-147-0",
+            blueprint_name="baton-codex-0-147-0",
             on_event=events.append,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
         self.assertEqual(result.event_count, 2)
@@ -215,18 +230,21 @@ class HandoffTests(unittest.TestCase):
                 "bundle_archive_path": "git/repository.bundle",
             },
         )
-        modal = _FakeModal()
+        runloop = _FakeRunloopClient()
 
         handoff_archive(
             archive_path=self.archive,
             prompt="continue the task",
-            image_name="baton-codex-0-147-0",
-            modal_module=modal,
+            blueprint_name="baton-codex-0-147-0",
+            runloop_client=runloop,
         )
 
-        commands = [command for command, _ in modal.sandbox.commands]
+        commands = [command for command, _ in runloop.devbox.commands]
         self.assertIn(
             (
+                "sudo",
+                "-n",
+                "--",
                 "git",
                 "clone",
                 "--no-checkout",
@@ -236,11 +254,24 @@ class HandoffTests(unittest.TestCase):
             commands,
         )
         self.assertIn(
-            ("git", "-C", REMOTE_WORKSPACE, "remote", "remove", "origin"),
+            (
+                "sudo",
+                "-n",
+                "--",
+                "git",
+                "-C",
+                REMOTE_WORKSPACE,
+                "remote",
+                "remove",
+                "origin",
+            ),
             commands,
         )
         self.assertIn(
             (
+                "sudo",
+                "-n",
+                "--",
                 "git",
                 "-C",
                 REMOTE_WORKSPACE,
@@ -263,33 +294,33 @@ class HandoffTests(unittest.TestCase):
                 "bundle_archive_path": "git/repository.bundle",
             },
         )
-        modal = _FakeModal(find_stdout=f"{REMOTE_WORKSPACE}/build\n")
+        runloop = _FakeRunloopClient(find_stdout=f"{REMOTE_WORKSPACE}/build\n")
 
         with self.assertRaisesRegex(HandoffError, "dependency/build output"):
             handoff_archive(
                 archive_path=self.archive,
                 prompt="continue the task",
-                image_name="baton-codex-0-147-0",
-                modal_module=modal,
+                blueprint_name="baton-codex-0-147-0",
+                runloop_client=runloop,
             )
 
         self.assertFalse(
-            any("codex" in command for command, _ in modal.sandbox.commands)
+            any("codex" in command for command, _ in runloop.devbox.commands)
         )
 
     def test_cleanup_failure_is_reported_after_an_otherwise_successful_handoff(self) -> None:
-        modal = _FakeModal(terminate_error=RuntimeError("network unavailable"))
+        runloop = _FakeRunloopClient(terminate_error=RuntimeError("network unavailable"))
 
-        with self.assertRaisesRegex(HandoffError, "Sandbox cleanup failed"):
+        with self.assertRaisesRegex(HandoffError, "Devbox cleanup failed"):
             handoff_archive(
                 archive_path=self.archive,
                 prompt="continue the task",
-                image_name="baton-codex-0-147-0",
-                modal_module=modal,
+                blueprint_name="baton-codex-0-147-0",
+                runloop_client=runloop,
             )
 
     def test_cleanup_failure_is_visible_alongside_a_resume_failure(self) -> None:
-        modal = _FakeModal(
+        runloop = _FakeRunloopClient(
             resume_returncode=2,
             resume_stderr="bad API key",
             terminate_error=RuntimeError("network unavailable"),
@@ -297,82 +328,84 @@ class HandoffTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             HandoffError,
-            "remote Codex resume failed.*Sandbox cleanup failed.*network unavailable",
+            "remote Codex resume failed.*Devbox cleanup failed.*network unavailable",
         ):
             handoff_archive(
                 archive_path=self.archive,
                 prompt="continue the task",
-                image_name="baton-codex-0-147-0",
-                modal_module=modal,
+                blueprint_name="baton-codex-0-147-0",
+                runloop_client=runloop,
             )
 
-    def test_detached_handoff_does_not_terminate_the_running_sandbox(self) -> None:
-        modal = _FakeModal()
+    def test_detached_handoff_does_not_terminate_the_running_devbox(self) -> None:
+        runloop = _FakeRunloopClient()
 
         result = handoff_archive(
             archive_path=self.archive,
             prompt="continue the task",
-            image_name="baton-codex-0-147-0",
+            blueprint_name="baton-codex-0-147-0",
             detach=True,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
         self.assertTrue(result.detached)
         self.assertIsNone(result.exit_code)
-        self.assertFalse(modal.sandbox.terminated)
-        self.assertTrue(modal.sandbox.detached)
+        self.assertFalse(runloop.devbox.terminated)
         completion_command = next(
             command
-            for command, _ in modal.sandbox.commands
-            if command[0] == "sh" and "marker_temp=$2" in command[2]
+            for command, _ in runloop.devbox.commands
+            if command[:4] == ("sudo", "-n", "sh", "-c")
+            and "marker_temp=$2" in command[4]
         )
         self.assertEqual(
-            completion_command[3:16],
+            completion_command[5:18],
             (
                 "baton-resume",
                 REMOTE_GIT_BASELINE,
                 REMOTE_COMPLETION_TEMP,
                 REMOTE_COMPLETION_MARKER,
                 REMOTE_RUNTIME_USER,
-                "runuser",
-                "--user",
+                "sudo",
+                "-n",
+                "-u",
                 REMOTE_RUNTIME_USER,
-                "--preserve-environment",
                 "--",
                 "env",
                 "HOME=/home/baton-agent",
                 f"CODEX_HOME={REMOTE_CODEX_HOME}",
             ),
         )
-        self.assertIn('"$@"', completion_command[2])
-        self.assertNotIn(REMOTE_GIT_BASELINE, completion_command[2])
-        self.assertNotIn(REMOTE_COMPLETION_MARKER, completion_command[2])
-        self.assertNotIn(REMOTE_COMPLETION_TEMP, completion_command[2])
+        self.assertIn('"$@"', completion_command[4])
+        self.assertNotIn(REMOTE_GIT_BASELINE, completion_command[4])
+        self.assertNotIn(REMOTE_COMPLETION_MARKER, completion_command[4])
+        self.assertNotIn(REMOTE_COMPLETION_TEMP, completion_command[4])
         self.assertLess(
-            completion_command[2].index("/usr/bin/pkill"),
-            completion_command[2].index("printf"),
+            completion_command[4].index("/usr/bin/pkill"),
+            completion_command[4].index("printf"),
         )
 
     def test_handoff_provisions_an_unprivileged_runtime_boundary(self) -> None:
-        modal = _FakeModal()
+        runloop = _FakeRunloopClient()
 
         handoff_archive(
             archive_path=self.archive,
             prompt="continue the task",
-            image_name="baton-codex-0-147-0",
-            modal_module=modal,
+            blueprint_name="baton-codex-0-147-0",
+            runloop_client=runloop,
         )
 
-        commands = [command for command, _ in modal.sandbox.commands]
-        self.assertIn(("mkdir", "-p", REMOTE_CONTROL_DIR), commands)
+        commands = [command for command, _ in runloop.devbox.commands]
+        root = ("sudo", "-n", "--")
+        self.assertIn((*root, "mkdir", "-p", REMOTE_CONTROL_DIR), commands)
         self.assertIn(
-            ("chown", "root:root", REMOTE_ROOT, REMOTE_CONTROL_DIR),
+            (*root, "chown", "root:root", REMOTE_ROOT, REMOTE_CONTROL_DIR),
             commands,
         )
-        self.assertIn(("chmod", "755", REMOTE_ROOT), commands)
-        self.assertIn(("chmod", "700", REMOTE_CONTROL_DIR), commands)
+        self.assertIn((*root, "chmod", "755", REMOTE_ROOT), commands)
+        self.assertIn((*root, "chmod", "700", REMOTE_CONTROL_DIR), commands)
         self.assertIn(
             (
+                *root,
                 "chown",
                 "-R",
                 f"{REMOTE_RUNTIME_USER}:{REMOTE_RUNTIME_USER}",
@@ -383,8 +416,9 @@ class HandoffTests(unittest.TestCase):
         )
         self.assertIn(
             (
-                "runuser",
-                "--user",
+                "sudo",
+                "-n",
+                "-u",
                 REMOTE_RUNTIME_USER,
                 "--",
                 "test",
@@ -396,8 +430,9 @@ class HandoffTests(unittest.TestCase):
         )
         self.assertIn(
             (
-                "runuser",
-                "--user",
+                "sudo",
+                "-n",
+                "-u",
                 REMOTE_RUNTIME_USER,
                 "--",
                 "test",
@@ -427,11 +462,12 @@ class HandoffTests(unittest.TestCase):
             "index_flags": "H app.py\0",
             "refs": f"refs/heads/main\0{'a' * 40}\0\0\n",
         }
-        modal = _FakeModal(
+        runloop = _FakeRunloopClient(
             git_stdout_by_command={
                 (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -441,8 +477,9 @@ class HandoffTests(unittest.TestCase):
                     "--show-toplevel",
                 ): f"{REMOTE_WORKSPACE}\n",
                 (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -452,8 +489,9 @@ class HandoffTests(unittest.TestCase):
                     "HEAD",
                 ): f"{expected_git_state['head']}\n",
                 (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -463,8 +501,9 @@ class HandoffTests(unittest.TestCase):
                     "--show-current",
                 ): f"{expected_git_state['branch']}\n",
                 (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -479,8 +518,9 @@ class HandoffTests(unittest.TestCase):
                     ":(exclude).baton",
                 ): expected_git_state["status"],
                 (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -492,8 +532,9 @@ class HandoffTests(unittest.TestCase):
                     "--",
                 ): expected_git_state["index"],
                 (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -505,8 +546,9 @@ class HandoffTests(unittest.TestCase):
                     "--",
                 ): expected_git_state["index_flags"],
                 (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -521,25 +563,25 @@ class HandoffTests(unittest.TestCase):
         handoff_archive(
             archive_path=self.archive,
             prompt="continue the task",
-            image_name="baton-codex-0-147-0",
+            blueprint_name="baton-codex-0-147-0",
             detach=True,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
         serialized_state = json.dumps(expected_git_state, separators=(",", ":"))
-        self.assertEqual(
-            modal.sandbox.filesystem.text_writes,
-            [(serialized_state, REMOTE_GIT_BASELINE)],
-        )
         completion_command = next(
             command
-            for command, _ in modal.sandbox.commands
-            if command[0] == "sh" and "marker_temp=$2" in command[2]
+            for command, _ in runloop.devbox.commands
+            if command[:4] == ("sudo", "-n", "sh", "-c")
+            and "marker_temp=$2" in command[4]
         )
-        commands = [command for command, _ in modal.sandbox.commands]
+        commands = [command for command, _ in runloop.devbox.commands]
         completion_index = commands.index(completion_command)
         ownership_boundary_index = commands.index(
             (
+                "sudo",
+                "-n",
+                "--",
                 "chown",
                 "-R",
                 f"{REMOTE_RUNTIME_USER}:{REMOTE_RUNTIME_USER}",
@@ -550,6 +592,9 @@ class HandoffTests(unittest.TestCase):
         self.assertLess(
             commands.index(
                 (
+                    "sudo",
+                    "-n",
+                    "--",
                     "git",
                     "clone",
                     "--no-checkout",
@@ -559,14 +604,15 @@ class HandoffTests(unittest.TestCase):
             ),
             ownership_boundary_index,
         )
-        for git_command in modal.sandbox.git_stdout_by_command:
+        for git_command in runloop.devbox.git_stdout_by_command:
             self.assertGreater(commands.index(git_command), ownership_boundary_index)
             self.assertLess(commands.index(git_command), completion_index)
             self.assertEqual(
-                git_command[:7],
+                git_command[:8],
                 (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -575,40 +621,51 @@ class HandoffTests(unittest.TestCase):
                 ),
             )
         self.assertLess(
-            commands.index(("chmod", "600", REMOTE_GIT_BASELINE)),
+            commands.index(
+                ("sudo", "-n", "--", "chmod", "600", REMOTE_GIT_BASELINE)
+            ),
             completion_index,
         )
-        self.assertEqual(completion_command[4], REMOTE_GIT_BASELINE)
-        self.assertEqual(completion_command[5], REMOTE_COMPLETION_TEMP)
-        self.assertEqual(completion_command[6], REMOTE_COMPLETION_MARKER)
-        self.assertEqual(completion_command[7], REMOTE_RUNTIME_USER)
-        self.assertNotIn(REMOTE_GIT_BASELINE, completion_command[2])
-        self.assertNotIn(REMOTE_COMPLETION_TEMP, completion_command[2])
-        self.assertNotIn(REMOTE_COMPLETION_MARKER, completion_command[2])
-        self.assertNotIn(serialized_state, completion_command[2])
-        self.assertIn('baseline_path=$1', completion_command[2])
+        baseline_write = next(
+            command
+            for command in commands
+            if command[:5] == ("sudo", "-n", "sh", "-c", 'umask 077; printf "%s" "$1" > "$2"')
+        )
+        self.assertEqual(baseline_write[-2:], (serialized_state, REMOTE_GIT_BASELINE))
+        self.assertEqual(completion_command[6], REMOTE_GIT_BASELINE)
+        self.assertEqual(completion_command[7], REMOTE_COMPLETION_TEMP)
+        self.assertEqual(completion_command[8], REMOTE_COMPLETION_MARKER)
+        self.assertEqual(completion_command[9], REMOTE_RUNTIME_USER)
+        self.assertNotIn(REMOTE_GIT_BASELINE, completion_command[4])
+        self.assertNotIn(REMOTE_COMPLETION_TEMP, completion_command[4])
+        self.assertNotIn(REMOTE_COMPLETION_MARKER, completion_command[4])
+        self.assertNotIn(serialized_state, completion_command[4])
+        self.assertIn('baseline_path=$1', completion_command[4])
 
     def test_detached_non_git_handoff_records_null_git_baseline(self) -> None:
-        modal = _FakeModal()
+        runloop = _FakeRunloopClient()
 
         handoff_archive(
             archive_path=self.archive,
             prompt="continue the task",
-            image_name="baton-codex-0-147-0",
+            blueprint_name="baton-codex-0-147-0",
             detach=True,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
-        self.assertEqual(
-            modal.sandbox.filesystem.text_writes,
-            [("null", REMOTE_GIT_BASELINE)],
+        self.assertTrue(
+            any(
+                command[-2:] == ("null", REMOTE_GIT_BASELINE)
+                for command, _ in runloop.devbox.commands
+            )
         )
         self.assertFalse(
             any(
                 command[:8]
                 == (
-                    "runuser",
-                    "--user",
+                    "sudo",
+                    "-n",
+                    "-u",
                     REMOTE_RUNTIME_USER,
                     "--",
                     "git",
@@ -616,7 +673,7 @@ class HandoffTests(unittest.TestCase):
                     REMOTE_WORKSPACE,
                     "rev-parse",
                 )
-                for command, _ in modal.sandbox.commands
+                for command, _ in runloop.devbox.commands
             )
         )
 
@@ -632,13 +689,13 @@ class HandoffTests(unittest.TestCase):
         (repository / "skipped.txt").write_text("skipped\n", encoding="utf-8")
         _run_git(repository, "add", "assumed.txt", "skipped.txt")
         _run_git(repository, "commit", "-qm", "baseline")
-        sandbox = _LocalGitSandbox(repository)
-        ordinary_index_flags = _capture_remote_git_state(sandbox)["index_flags"]
+        devbox = _LocalGitDevbox(repository)
+        ordinary_index_flags = _capture_remote_git_state(devbox)["index_flags"]
 
         _run_git(repository, "update-index", "--assume-unchanged", "assumed.txt")
         _run_git(repository, "update-index", "--skip-worktree", "skipped.txt")
 
-        flagged_index_flags = _capture_remote_git_state(sandbox)["index_flags"]
+        flagged_index_flags = _capture_remote_git_state(devbox)["index_flags"]
         self.assertNotEqual(flagged_index_flags, ordinary_index_flags)
 
     def test_git_baseline_captures_remote_tracking_and_notes_refs(self) -> None:
@@ -653,30 +710,33 @@ class HandoffTests(unittest.TestCase):
         _run_git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
         _run_git(repository, "update-ref", "refs/notes/review", "HEAD")
 
-        refs = _capture_remote_git_state(_LocalGitSandbox(repository))["refs"]
+        refs = _capture_remote_git_state(_LocalGitDevbox(repository))["refs"]
 
         self.assertIn("refs/remotes/origin/main\0", refs)
         self.assertIn("refs/notes/review\0", refs)
 
-    def test_runtime_image_bakes_pinned_codex_and_git_without_a_dockerfile(self) -> None:
-        modal = _FakeModal()
+    def test_prepare_builds_a_pinned_runloop_blueprint(self) -> None:
+        runloop = _FakeRunloopClient()
 
-        _runtime_image(modal, "0.147.0")
-
-        self.assertEqual(modal.image.registry_tags, ["node:22-bookworm-slim"])
-        self.assertIn("git", modal.image.apt_packages)
-        self.assertIn("passwd", modal.image.apt_packages)
-        self.assertIn("procps", modal.image.apt_packages)
-        self.assertIn("util-linux", modal.image.apt_packages)
-        self.assertEqual(
-            modal.image.commands,
-            [
-                "useradd --create-home --shell /bin/bash baton-agent",
-                "npm install --global @openai/codex@0.147.0",
-                "codex --version",
-                "git --version",
-            ],
+        result = prepare_runtime(
+            codex_version="0.147.0",
+            blueprint_name="baton-codex-0-147-0",
+            runloop_client=runloop,
         )
+
+        self.assertEqual(result.blueprint_name, "baton-codex-0-147-0")
+        self.assertEqual(result.codex_version, "0.147.0")
+        self.assertEqual(
+            runloop.blueprint_calls[0]["name"],
+            "baton-codex-0-147-0",
+        )
+        commands = runloop.blueprint_calls[0]["launch_parameters"]["launch_commands"]
+        self.assertTrue(any("git" in command for command in commands))
+        self.assertIn("sudo useradd --create-home --shell /bin/bash baton-agent || true", commands)
+        self.assertIn("sudo npm install --global @openai/codex@0.147.0", commands)
+
+    def test_blueprint_name_tracks_the_codex_version(self) -> None:
+        self.assertEqual(blueprint_name_for_version("0.147.0"), "baton-codex-0-147-0")
 
     def _write_archive(
         self,
@@ -745,14 +805,14 @@ class _FakeProcess:
         return self.returncode
 
 
-class _LocalGitSandbox:
+class _LocalGitDevbox:
     def __init__(self, repository: Path) -> None:
         self.repository = repository
 
     def exec(self, *command: str, **kwargs: object) -> _FakeProcess:
         translated = list(command)
-        if translated[:4] == ["runuser", "--user", REMOTE_RUNTIME_USER, "--"]:
-            translated = translated[4:]
+        if translated[:5] == ["sudo", "-n", "-u", REMOTE_RUNTIME_USER, "--"]:
+            translated = translated[5:]
         if translated[:3] == ["git", "-C", REMOTE_WORKSPACE]:
             translated[2] = str(self.repository)
         completed = subprocess.run(
@@ -763,8 +823,9 @@ class _LocalGitSandbox:
         )
         stdout = completed.stdout
         if command == (
-            "runuser",
-            "--user",
+            "sudo",
+            "-n",
+            "-u",
             REMOTE_RUNTIME_USER,
             "--",
             "git",
@@ -793,16 +854,11 @@ def _run_git(repository: Path, *arguments: str) -> None:
 class _FakeFilesystem:
     def __init__(self) -> None:
         self.copies: list[tuple[Path, str]] = []
-        self.text_writes: list[tuple[str, str]] = []
 
     def copy_from_local(self, local_path: Path, remote_path: str) -> None:
         self.copies.append((Path(local_path).resolve(), remote_path))
 
-    def write_text(self, contents: str, remote_path: str) -> None:
-        self.text_writes.append((contents, remote_path))
-
-
-class _FakeSandbox:
+class _FakeDevboxState:
     def __init__(
         self,
         *,
@@ -812,9 +868,8 @@ class _FakeSandbox:
         find_stdout: str = "",
         git_stdout_by_command: dict[tuple[str, ...], str] | None = None,
         terminate_error: Exception | None = None,
-        detach_error: Exception | None = None,
     ) -> None:
-        self.object_id = "sb-test"
+        self.id = "dbx-test"
         self.filesystem = _FakeFilesystem()
         self.commands: list[tuple[tuple[str, ...], dict[str, object]]] = []
         self.resume_returncode = resume_returncode
@@ -826,87 +881,89 @@ class _FakeSandbox:
         self.find_stdout = find_stdout
         self.git_stdout_by_command = git_stdout_by_command or {}
         self.terminate_error = terminate_error
-        self.detach_error = detach_error
         self.terminated = False
-        self.detached = False
 
-    def exec(self, *command: str, **kwargs: object) -> _FakeProcess:
-        self.commands.append((command, kwargs))
-        if "codex" in command:
-            return _FakeProcess(
-                stdout=self.resume_stdout,
-                stderr=[self.resume_stderr],
-                returncode=self.resume_returncode,
+
+class _Object:
+    def __init__(self, **values: object) -> None:
+        self.__dict__.update(values)
+
+
+class _FakeExecutions:
+    def __init__(self, parent: _FakeRunloopClient) -> None:
+        self.parent = parent
+        self.results: dict[str, _FakeProcess] = {}
+
+    def execute_async(self, devbox_id: str, *, command: str) -> _Object:
+        parsed = tuple(shlex.split(command))
+        command_metadata: dict[str, object] = {}
+        if parsed[:2] == ("timeout", "--preserve-status"):
+            command_metadata["timeout"] = int(parsed[2])
+            parsed = parsed[3:]
+        execution_id = f"exec-{len(self.results) + 1}"
+        state = self.parent.devbox
+        state.commands.append((parsed, command_metadata))
+        if "codex" in parsed:
+            process = _FakeProcess(
+                stdout=state.resume_stdout,
+                stderr=[state.resume_stderr],
+                returncode=state.resume_returncode,
             )
-        if command[0] == "find":
-            return _FakeProcess(stdout=[self.find_stdout])
-        if command in self.git_stdout_by_command:
-            return _FakeProcess(stdout=[self.git_stdout_by_command[command]])
-        return _FakeProcess()
+        elif "find" in parsed:
+            process = _FakeProcess(stdout=[state.find_stdout])
+        elif parsed in state.git_stdout_by_command:
+            process = _FakeProcess(stdout=[state.git_stdout_by_command[parsed]])
+        else:
+            process = _FakeProcess()
+        self.results[execution_id] = process
+        return _Object(execution_id=execution_id)
 
-    def terminate(self) -> None:
-        self.terminated = True
-        if self.terminate_error is not None:
-            raise self.terminate_error
+    def await_completed(self, execution_id: str, *, devbox_id: str) -> _Object:
+        process = self.results[execution_id]
+        return _Object(
+            stdout=process.stdout.read(),
+            stderr=process.stderr.read(),
+            exit_status=process.returncode,
+        )
 
-    def detach(self) -> None:
-        self.detached = True
-        if self.detach_error is not None:
-            raise self.detach_error
-
-
-class _FakeImage:
-    def __init__(self) -> None:
-        self.registry_tags: list[str] = []
-        self.apt_packages: tuple[str, ...] = ()
-        self.commands: list[str] = []
-        self.named_images: list[str] = []
-
-    def from_registry(self, tag: str) -> _FakeImage:
-        self.registry_tags.append(tag)
-        return self
-
-    def from_name(self, name: str) -> _FakeImage:
-        self.named_images.append(name)
-        return self
-
-    def apt_install(self, *packages: str) -> _FakeImage:
-        self.apt_packages = packages
-        return self
-
-    def run_commands(self, *commands: str) -> _FakeImage:
-        self.commands = list(commands)
-        return self
+    def stream_stdout_updates(self, execution_id: str, *, devbox_id: str):
+        for chunk in self.results[execution_id].stdout.values:
+            yield _Object(output=chunk)
 
 
-class _FakeApp:
-    def __init__(self, parent: _FakeModal) -> None:
+class _FakeDevboxes:
+    def __init__(self, parent: _FakeRunloopClient) -> None:
+        self.parent = parent
+        self.executions = _FakeExecutions(parent)
+
+    def create_and_await_running(self, **kwargs: object) -> _Object:
+        self.parent.create_calls.append(kwargs)
+        return _Object(id=self.parent.devbox.id)
+
+    def upload_file(self, devbox_id: str, *, path: str, file: Any) -> None:
+        self.parent.devbox.filesystem.copies.append((Path(file.name).resolve(), path))
+
+    def write_file_contents(
+        self, devbox_id: str, *, file_path: str, contents: str
+    ) -> None:
+        raise AssertionError("handoff must write root control files through sudo")
+
+    def shutdown(self, devbox_id: str) -> None:
+        self.parent.devbox.terminated = True
+        if self.parent.devbox.terminate_error is not None:
+            raise self.parent.devbox.terminate_error
+
+
+class _FakeBlueprints:
+    def __init__(self, parent: _FakeRunloopClient) -> None:
         self.parent = parent
 
-    def lookup(self, name: str, *, create_if_missing: bool):
-        self.parent.app_lookup_calls.append((name, create_if_missing))
-        return {"name": name}
+    def create_and_await_build_complete(self, **kwargs: object) -> _Object:
+        self.parent.blueprint_calls.append(kwargs)
+        return _Object(id="bpt-test")
 
 
-class _FakeSecret:
-    def __init__(self, parent: _FakeModal) -> None:
-        self.parent = parent
-
-    def from_name(self, name: str, *, required_keys: list[str]):
-        self.parent.secret_calls.append((name, tuple(required_keys)))
-        return {"name": name}
-
-
-class _FakeSandboxFactory:
-    def __init__(self, parent: _FakeModal) -> None:
-        self.parent = parent
-
-    def create(self, **kwargs: object) -> _FakeSandbox:
-        self.parent.sandbox_create_kwargs = kwargs
-        return self.parent.sandbox
-
-
-class _FakeModal:
+class _FakeRunloopClient:
     def __init__(
         self,
         *,
@@ -916,22 +973,16 @@ class _FakeModal:
         find_stdout: str = "",
         git_stdout_by_command: dict[tuple[str, ...], str] | None = None,
         terminate_error: Exception | None = None,
-        detach_error: Exception | None = None,
     ) -> None:
-        self.app_lookup_calls: list[tuple[str, bool]] = []
-        self.secret_calls: list[tuple[str, tuple[str, ...]]] = []
-        self.sandbox_create_kwargs: dict[str, object] = {}
-        self.image = _FakeImage()
-        self.App = _FakeApp(self)
-        self.Image = self.image
-        self.Secret = _FakeSecret(self)
-        self.sandbox = _FakeSandbox(
+        self.create_calls: list[dict[str, Any]] = []
+        self.blueprint_calls: list[dict[str, Any]] = []
+        self.devbox = _FakeDevboxState(
             resume_returncode=resume_returncode,
             resume_stderr=resume_stderr,
             resume_stdout=resume_stdout,
             find_stdout=find_stdout,
             git_stdout_by_command=git_stdout_by_command,
             terminate_error=terminate_error,
-            detach_error=detach_error,
         )
-        self.Sandbox = _FakeSandboxFactory(self)
+        self.devboxes = _FakeDevboxes(self)
+        self.blueprints = _FakeBlueprints(self)

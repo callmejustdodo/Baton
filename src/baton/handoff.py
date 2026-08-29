@@ -1,4 +1,4 @@
-"""Move a verified Baton archive into a Modal Sandbox and resume Codex there."""
+"""Move a verified Baton archive into a Runloop Devbox and resume Codex there."""
 
 from __future__ import annotations
 
@@ -13,10 +13,16 @@ from threading import Thread
 from typing import Any
 from uuid import UUID
 
+from .runloop import (
+    DEFAULT_RUNLOOP_BLUEPRINT,
+    DEFAULT_RUNLOOP_SECRET,
+    RunloopClientError,
+    build_blueprint,
+    create_devbox,
+    load_runloop_client,
+)
 from .snapshot import ARCHIVE_FORMAT_VERSION
 
-DEFAULT_MODAL_APP = "baton"
-DEFAULT_MODAL_SECRET = "baton-openai"
 REMOTE_ARCHIVE = "/tmp/baton-snapshot.tar.gz"
 REMOTE_ROOT = "/baton"
 REMOTE_STAGE = f"{REMOTE_ROOT}/stage"
@@ -34,7 +40,7 @@ NATIVE_BUILD_COMPONENTS = frozenset({".venv", "build", "dist", "node_modules", "
 
 
 class HandoffError(RuntimeError):
-    """Raised when a Baton archive cannot safely run in a Modal Sandbox."""
+    """Raised when a Baton archive cannot safely run in a Runloop Devbox."""
 
 
 @dataclass(frozen=True)
@@ -52,16 +58,14 @@ class SnapshotArchive:
 
 @dataclass(frozen=True)
 class PreparedRuntime:
-    """A named Modal image that contains the matching Codex CLI and Git."""
+    """A named Runloop Blueprint that contains the matching Codex CLI and Git."""
 
-    app_name: str
-    image_name: str
+    blueprint_name: str
     codex_version: str
 
     def to_dict(self) -> dict[str, str]:
         return {
-            "modal_app": self.app_name,
-            "image_name": self.image_name,
+            "blueprint_name": self.blueprint_name,
             "codex_version": self.codex_version,
         }
 
@@ -72,7 +76,7 @@ class HandoffResult:
 
     archive: Path
     session_id: str
-    sandbox_id: str
+    devbox_id: str
     detached: bool
     event_count: int
     exit_code: int | None
@@ -81,7 +85,7 @@ class HandoffResult:
         return {
             "archive": str(self.archive),
             "session_id": self.session_id,
-            "sandbox_id": self.sandbox_id,
+            "devbox_id": self.devbox_id,
             "detached": self.detached,
             "event_count": self.event_count,
             "exit_code": self.exit_code,
@@ -171,8 +175,8 @@ def infer_local_codex_version() -> str:
     return match.group(1)
 
 
-def image_name_for_version(codex_version: str) -> str:
-    """Name a reusable Modal image after the exact Codex version it contains."""
+def blueprint_name_for_version(codex_version: str) -> str:
+    """Name a reusable Runloop Blueprint after the exact Codex version it contains."""
 
     normalized_version = _normalize_codex_version(codex_version)
     return f"baton-codex-{normalized_version.replace('.', '-')}"
@@ -181,26 +185,26 @@ def image_name_for_version(codex_version: str) -> str:
 def prepare_runtime(
     *,
     codex_version: str,
-    app_name: str = DEFAULT_MODAL_APP,
-    image_name: str | None = None,
-    modal_module: Any | None = None,
+    blueprint_name: str | None = None,
+    runloop_client: Any | None = None,
 ) -> PreparedRuntime:
-    """Build and publish the named Modal image used by later handoffs."""
+    """Build the named Runloop Blueprint used by later handoffs."""
 
     normalized_version = _normalize_codex_version(codex_version)
-    resolved_image_name = image_name or image_name_for_version(normalized_version)
-    _require_nonempty_label("Modal app name", app_name)
-    _require_nonempty_label("Modal image name", resolved_image_name)
-    modal = modal_module or _load_modal()
+    resolved_blueprint_name = blueprint_name or blueprint_name_for_version(normalized_version)
+    _require_nonempty_label("Runloop Blueprint name", resolved_blueprint_name)
     try:
-        app = modal.App.lookup(app_name, create_if_missing=True)
-        image = _runtime_image(modal, normalized_version)
-        image.build(app).publish(resolved_image_name)
-    except Exception as error:
-        raise HandoffError(f"Modal image build failed: {error}") from error
+        client = runloop_client or load_runloop_client()
+        build_blueprint(
+            client,
+            blueprint_name=resolved_blueprint_name,
+            codex_version=normalized_version,
+            runtime_user=REMOTE_RUNTIME_USER,
+        )
+    except RunloopClientError as error:
+        raise HandoffError(str(error)) from error
     return PreparedRuntime(
-        app_name=app_name,
-        image_name=resolved_image_name,
+        blueprint_name=resolved_blueprint_name,
         codex_version=normalized_version,
     )
 
@@ -209,18 +213,17 @@ def handoff_archive(
     *,
     archive_path: Path,
     prompt: str,
-    modal_secret: str = DEFAULT_MODAL_SECRET,
-    app_name: str = DEFAULT_MODAL_APP,
-    image_name: str,
-    sandbox_timeout: int = 20 * 60,
+    runloop_secret: str = DEFAULT_RUNLOOP_SECRET,
+    blueprint_name: str = DEFAULT_RUNLOOP_BLUEPRINT,
+    devbox_timeout: int = 20 * 60,
     command_timeout: int = 20 * 60,
     detach: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
-    modal_module: Any | None = None,
+    runloop_client: Any | None = None,
 ) -> HandoffResult:
-    """Restore an archive in Modal and run ``codex exec resume`` there.
+    """Restore an archive in Runloop and run ``codex exec resume`` there.
 
-    The remote command receives only the named Modal Secret. Local Codex OAuth
+    The remote command receives only the named Runloop Secret. Local Codex OAuth
     files are neither consulted nor copied.
     """
 
@@ -230,45 +233,40 @@ def handoff_archive(
         prompt,
         skip_git_repo_check=not snapshot.repository["present"],
     )
-    _validate_timeout("sandbox timeout", sandbox_timeout)
+    _validate_timeout("Devbox timeout", devbox_timeout)
     _validate_timeout("command timeout", command_timeout)
-    _require_nonempty_label("Modal app name", app_name)
-    _require_nonempty_label("Modal image name", image_name)
-    _require_nonempty_label("Modal Secret name", modal_secret)
+    _require_nonempty_label("Runloop Blueprint name", blueprint_name)
+    _require_nonempty_label("Runloop Secret name", runloop_secret)
 
-    modal = modal_module or _load_modal()
     try:
-        app = modal.App.lookup(app_name, create_if_missing=True)
-        image = modal.Image.from_name(image_name)
-        secret = modal.Secret.from_name(
-            modal_secret,
-            required_keys=["OPENAI_API_KEY"],
-        )
-        sandbox = modal.Sandbox.create(
-            app=app,
-            image=image,
+        client = runloop_client or load_runloop_client()
+        devbox = create_devbox(
+            client,
+            blueprint_name=blueprint_name,
+            secret_name=runloop_secret,
             name=f"baton-{snapshot.session_id[:8]}",
-            secrets=[secret],
-            timeout=sandbox_timeout,
+            keep_alive_seconds=devbox_timeout,
         )
-    except Exception as error:
-        raise HandoffError(f"Modal Sandbox creation failed: {error}") from error
-    sandbox_id = _sandbox_id(sandbox)
+    except RunloopClientError as error:
+        raise HandoffError(str(error)) from error
+    devbox_id = devbox.id
     detached = False
     primary_error: BaseException | None = None
 
     try:
-        sandbox.filesystem.copy_from_local(snapshot.path, REMOTE_ARCHIVE)
-        _restore_snapshot(sandbox, snapshot)
-        _configure_api_key_auth(sandbox)
-        _configure_runtime_privilege_boundary(sandbox)
+        devbox.filesystem.copy_from_local(snapshot.path, REMOTE_ARCHIVE)
+        _restore_snapshot(devbox, snapshot)
+        _configure_api_key_auth(devbox)
+        _configure_runtime_privilege_boundary(devbox)
 
         if detach:
             baseline_git_state = (
-                _capture_remote_git_state(sandbox) if snapshot.repository["present"] else None
+                _capture_remote_git_state(devbox) if snapshot.repository["present"] else None
             )
-            _write_detached_git_baseline(sandbox, baseline_git_state)
-            sandbox.exec(
+            _write_detached_git_baseline(devbox, baseline_git_state)
+            devbox.exec(
+                "sudo",
+                "-n",
                 "sh",
                 "-c",
                 (
@@ -289,10 +287,10 @@ def handoff_archive(
                 REMOTE_COMPLETION_TEMP,
                 REMOTE_COMPLETION_MARKER,
                 REMOTE_RUNTIME_USER,
-                "runuser",
-                "--user",
+                "sudo",
+                "-n",
+                "-u",
                 REMOTE_RUNTIME_USER,
-                "--preserve-environment",
                 "--",
                 "env",
                 "HOME=/home/baton-agent",
@@ -300,22 +298,22 @@ def handoff_archive(
                 *resume_command,
                 timeout=command_timeout,
             )
-            sandbox.detach()
+            devbox.detach()
             detached = True
             return HandoffResult(
                 archive=snapshot.path,
                 session_id=snapshot.session_id,
-                sandbox_id=sandbox_id,
+                devbox_id=devbox_id,
                 detached=True,
                 event_count=0,
                 exit_code=None,
             )
 
-        process = sandbox.exec(
-            "runuser",
-            "--user",
+        process = devbox.exec(
+            "sudo",
+            "-n",
+            "-u",
             REMOTE_RUNTIME_USER,
-            "--preserve-environment",
             "--",
             "env",
             "HOME=/home/baton-agent",
@@ -327,7 +325,7 @@ def handoff_archive(
         return HandoffResult(
             archive=snapshot.path,
             session_id=snapshot.session_id,
-            sandbox_id=sandbox_id,
+            devbox_id=devbox_id,
             detached=False,
             event_count=event_count,
             exit_code=_process_returncode(process),
@@ -336,7 +334,7 @@ def handoff_archive(
         primary_error = error
         raise
     except Exception as error:
-        handoff_error = HandoffError(f"Modal handoff failed: {error}")
+        handoff_error = HandoffError(f"Runloop handoff failed: {error}")
         primary_error = handoff_error
         raise handoff_error from error
     except BaseException as error:
@@ -344,7 +342,7 @@ def handoff_archive(
         raise
     finally:
         if not detached:
-            cleanup_error = _cleanup_sandbox(sandbox)
+            cleanup_error = _cleanup_devbox(devbox)
             if cleanup_error is not None:
                 if primary_error is None:
                     raise cleanup_error
@@ -354,52 +352,32 @@ def handoff_archive(
                     primary_error.add_note(str(cleanup_error))
 
 
-def _runtime_image(modal: Any, codex_version: str) -> Any:
-    """Define the Linux x86_64 Sandbox image entirely through ``modal.Image``."""
-
-    return (
-        modal.Image.from_registry("node:22-bookworm-slim")
-        .apt_install(
-            "ca-certificates",
-            "git",
-            "gzip",
-            "passwd",
-            "procps",
-            "tar",
-            "util-linux",
-        )
-        .run_commands(
-            f"useradd --create-home --shell /bin/bash {REMOTE_RUNTIME_USER}",
-            f"npm install --global @openai/codex@{codex_version}",
-            "codex --version",
-            "git --version",
-        )
-    )
-
-
-def _restore_snapshot(sandbox: Any, snapshot: SnapshotArchive) -> None:
-    _run_checked(sandbox, "mkdir", "-p", REMOTE_STAGE)
-    _run_checked(sandbox, "tar", "-xzf", REMOTE_ARCHIVE, "-C", REMOTE_STAGE)
-    _run_checked(sandbox, "test", "-f", f"{REMOTE_STAGE}/manifest.json")
-    _run_checked(sandbox, "test", "-d", f"{REMOTE_STAGE}/codex")
-    _run_checked(sandbox, "test", "-d", f"{REMOTE_STAGE}/workspace")
+def _restore_snapshot(devbox: Any, snapshot: SnapshotArchive) -> None:
+    _run_root_checked(devbox, "mkdir", "-p", REMOTE_STAGE)
+    _run_root_checked(devbox, "tar", "-xzf", REMOTE_ARCHIVE, "-C", REMOTE_STAGE)
+    _run_root_checked(devbox, "test", "-f", f"{REMOTE_STAGE}/manifest.json")
+    _run_root_checked(devbox, "test", "-d", f"{REMOTE_STAGE}/codex")
+    _run_root_checked(devbox, "test", "-d", f"{REMOTE_STAGE}/workspace")
 
     if snapshot.repository["present"]:
-        _restore_git_workspace(sandbox, snapshot.repository)
+        _restore_git_workspace(devbox, snapshot.repository)
     else:
-        _run_checked(sandbox, "mv", f"{REMOTE_STAGE}/workspace", REMOTE_WORKSPACE)
+        _run_root_checked(devbox, "mv", f"{REMOTE_STAGE}/workspace", REMOTE_WORKSPACE)
 
-    _assert_remote_workspace_portable(sandbox)
-    _run_checked(sandbox, "mv", f"{REMOTE_STAGE}/codex", REMOTE_CODEX_HOME)
-    _run_checked(sandbox, "test", "-d", REMOTE_CODEX_HOME)
-    _run_checked(sandbox, "test", "-d", REMOTE_WORKSPACE)
+    _assert_remote_workspace_portable(devbox)
+    _run_root_checked(devbox, "mv", f"{REMOTE_STAGE}/codex", REMOTE_CODEX_HOME)
+    _run_root_checked(devbox, "test", "-d", REMOTE_CODEX_HOME)
+    _run_root_checked(devbox, "test", "-d", REMOTE_WORKSPACE)
 
 
-def _configure_api_key_auth(sandbox: Any) -> None:
-    """Create ephemeral Codex API-key auth from Modal's injected Secret."""
+def _configure_api_key_auth(devbox: Any) -> None:
+    """Create ephemeral Codex API-key auth from Runloop's injected Secret."""
 
     _run_checked(
-        sandbox,
+        devbox,
+        "sudo",
+        "-n",
+        "--preserve-env=OPENAI_API_KEY",
         "sh",
         "-c",
         (
@@ -415,11 +393,11 @@ def _configure_api_key_auth(sandbox: Any) -> None:
 def _configure_runtime_privilege_boundary(sandbox: Any) -> None:
     """Give Codex its mutable trees while keeping Baton control files root-only."""
 
-    _run_checked(sandbox, "mkdir", "-p", REMOTE_CONTROL_DIR)
-    _run_checked(sandbox, "chown", "root:root", REMOTE_ROOT, REMOTE_CONTROL_DIR)
-    _run_checked(sandbox, "chmod", "755", REMOTE_ROOT)
-    _run_checked(sandbox, "chmod", "700", REMOTE_CONTROL_DIR)
-    _run_checked(
+    _run_root_checked(sandbox, "mkdir", "-p", REMOTE_CONTROL_DIR)
+    _run_root_checked(sandbox, "chown", "root:root", REMOTE_ROOT, REMOTE_CONTROL_DIR)
+    _run_root_checked(sandbox, "chmod", "755", REMOTE_ROOT)
+    _run_root_checked(sandbox, "chmod", "700", REMOTE_CONTROL_DIR)
+    _run_root_checked(
         sandbox,
         "chown",
         "-R",
@@ -429,8 +407,9 @@ def _configure_runtime_privilege_boundary(sandbox: Any) -> None:
     )
     _run_checked(
         sandbox,
-        "runuser",
-        "--user",
+        "sudo",
+        "-n",
+        "-u",
         REMOTE_RUNTIME_USER,
         "--",
         "test",
@@ -439,8 +418,9 @@ def _configure_runtime_privilege_boundary(sandbox: Any) -> None:
     )
     _run_checked(
         sandbox,
-        "runuser",
-        "--user",
+        "sudo",
+        "-n",
+        "-u",
         REMOTE_RUNTIME_USER,
         "--",
         "test",
@@ -449,8 +429,9 @@ def _configure_runtime_privilege_boundary(sandbox: Any) -> None:
     )
     _run_checked(
         sandbox,
-        "runuser",
-        "--user",
+        "sudo",
+        "-n",
+        "-u",
         REMOTE_RUNTIME_USER,
         "--",
         "test",
@@ -460,8 +441,9 @@ def _configure_runtime_privilege_boundary(sandbox: Any) -> None:
     )
     _run_checked(
         sandbox,
-        "runuser",
-        "--user",
+        "sudo",
+        "-n",
+        "-u",
         REMOTE_RUNTIME_USER,
         "--",
         "test",
@@ -481,22 +463,37 @@ def _restore_git_workspace(sandbox: Any, repository: Mapping[str, Any]) -> None:
         raise HandoffError("snapshot Git metadata has an invalid repository bundle path")
 
     bundle_path = f"{REMOTE_STAGE}/{GIT_BUNDLE_ARCHIVE}"
-    _run_checked(sandbox, "git", "clone", "--no-checkout", bundle_path, REMOTE_WORKSPACE)
+    _run_root_checked(sandbox, "git", "clone", "--no-checkout", bundle_path, REMOTE_WORKSPACE)
 
     if branch:
-        _run_checked(sandbox, "git", "-C", REMOTE_WORKSPACE, "checkout", "-B", branch, head)
+        _run_root_checked(
+            sandbox, "git", "-C", REMOTE_WORKSPACE, "checkout", "-B", branch, head
+        )
     else:
-        _run_checked(sandbox, "git", "-C", REMOTE_WORKSPACE, "checkout", "--detach", head)
+        _run_root_checked(
+            sandbox, "git", "-C", REMOTE_WORKSPACE, "checkout", "--detach", head
+        )
 
     origin = repository.get("origin_url")
     if origin is None:
-        _run_checked(sandbox, "git", "-C", REMOTE_WORKSPACE, "remote", "remove", "origin")
+        _run_root_checked(
+            sandbox, "git", "-C", REMOTE_WORKSPACE, "remote", "remove", "origin"
+        )
     elif isinstance(origin, str) and origin:
-        _run_checked(sandbox, "git", "-C", REMOTE_WORKSPACE, "remote", "set-url", "origin", origin)
+        _run_root_checked(
+            sandbox,
+            "git",
+            "-C",
+            REMOTE_WORKSPACE,
+            "remote",
+            "set-url",
+            "origin",
+            origin,
+        )
     else:
         raise HandoffError("snapshot repository origin URL is invalid")
 
-    _run_checked(
+    _run_root_checked(
         sandbox,
         "git",
         "-C",
@@ -506,7 +503,7 @@ def _restore_git_workspace(sandbox: Any, repository: Mapping[str, Any]) -> None:
         "--allow-empty",
         f"{REMOTE_STAGE}/git/staged.patch",
     )
-    _run_checked(
+    _run_root_checked(
         sandbox,
         "git",
         "-C",
@@ -515,7 +512,7 @@ def _restore_git_workspace(sandbox: Any, repository: Mapping[str, Any]) -> None:
         "--allow-empty",
         f"{REMOTE_STAGE}/git/unstaged.patch",
     )
-    _run_checked(
+    _run_root_checked(
         sandbox,
         "cp",
         "-a",
@@ -590,8 +587,9 @@ def _run_runtime_git_checked(sandbox: Any, *arguments: str) -> str:
 
     return _run_checked(
         sandbox,
-        "runuser",
-        "--user",
+        "sudo",
+        "-n",
+        "-u",
         REMOTE_RUNTIME_USER,
         "--",
         "git",
@@ -607,20 +605,26 @@ def _write_detached_git_baseline(
 ) -> None:
     """Write the JSON value used by the detached completion-marker wrapper."""
 
-    try:
-        sandbox.filesystem.write_text(
-            json.dumps(git_state, separators=(",", ":")),
-            REMOTE_GIT_BASELINE,
-        )
-    except Exception as error:
-        raise HandoffError(f"could not write detached Git baseline: {error}") from error
-    _run_checked(sandbox, "chmod", "600", REMOTE_GIT_BASELINE)
+    serialized = json.dumps(git_state, separators=(",", ":"))
+    _run_checked(
+        sandbox,
+        "sudo",
+        "-n",
+        "sh",
+        "-c",
+        'umask 077; printf "%s" "$1" > "$2"',
+        "baton-write-baseline",
+        serialized,
+        REMOTE_GIT_BASELINE,
+    )
+    _run_root_checked(sandbox, "chown", "root:root", REMOTE_GIT_BASELINE)
+    _run_root_checked(sandbox, "chmod", "600", REMOTE_GIT_BASELINE)
 
 
 def _assert_remote_workspace_portable(sandbox: Any) -> None:
     """Reject source trees that would require a cross-platform native rebuild."""
 
-    native_directory = _run_checked(
+    native_directory = _run_root_checked(
         sandbox,
         "find",
         REMOTE_WORKSPACE,
@@ -651,7 +655,7 @@ def _assert_remote_workspace_portable(sandbox: Any) -> None:
             f"to Linux x86_64: {native_directory}. Baton will not rebuild native dependencies."
         )
 
-    native_file = _run_checked(
+    native_file = _run_root_checked(
         sandbox,
         "find",
         REMOTE_WORKSPACE,
@@ -699,6 +703,12 @@ def _run_checked(sandbox: Any, *command: str) -> str:
             f"remote setup command failed (exit {returncode}): {rendered_command}: {detail}"
         )
     return stdout
+
+
+def _run_root_checked(devbox: Any, *command: str) -> str:
+    """Run one fixed setup argv with non-interactive root escalation."""
+
+    return _run_checked(devbox, "sudo", "-n", "--", *command)
 
 
 def _stream_codex_events(
@@ -868,7 +878,7 @@ def _validate_manifest(manifest: Any, member_names: set[str]) -> str:
     if "codex/auth.json" in member_names:
         raise HandoffError(
             "snapshot archive must not contain Codex auth.json; "
-            "Baton authenticates only with the Modal OPENAI_API_KEY Secret"
+            "Baton authenticates only with the Runloop OPENAI_API_KEY Secret"
         )
     return session_id
 
@@ -945,29 +955,9 @@ def _process_returncode(process: Any) -> int:
     return returncode
 
 
-def _sandbox_id(sandbox: Any) -> str:
-    value = getattr(sandbox, "object_id", None) or getattr(sandbox, "id", None)
-    return str(value) if value else "unknown"
-
-
-def _cleanup_sandbox(sandbox: Any) -> HandoffError | None:
-    failures: list[str] = []
+def _cleanup_devbox(devbox: Any) -> HandoffError | None:
     try:
-        sandbox.terminate()
-    except Exception as error:  # noqa: BLE001 - cleanup must report any Modal SDK failure
-        failures.append(f"terminate failed: {error}")
-    try:
-        sandbox.detach()
-    except Exception as error:  # noqa: BLE001 - cleanup must report any Modal SDK failure
-        failures.append(f"detach failed: {error}")
-    if failures:
-        return HandoffError("Modal Sandbox cleanup failed: " + "; ".join(failures))
+        devbox.terminate()
+    except Exception as error:  # noqa: BLE001 - cleanup must report any Runloop SDK failure
+        return HandoffError(f"Runloop Devbox cleanup failed: shutdown failed: {error}")
     return None
-
-
-def _load_modal() -> Any:
-    try:
-        import modal
-    except ImportError as error:
-        raise HandoffError("Modal SDK is required; install Baton with its Modal dependency") from error
-    return modal
