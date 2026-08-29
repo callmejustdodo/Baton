@@ -1,6 +1,6 @@
 # Baton
 
-Move an in-progress Codex session from your laptop to a [Modal Sandbox](https://modal.com/docs/guide/sandboxes), then retrieve the remote workspace for review after the agent finishes.
+Move an in-progress Codex session from your laptop to a [Modal Sandbox](https://modal.com/docs/guide/sandboxes), then safely bring the completed remote work back after the agent finishes.
 
 Baton snapshots the selected Codex rollout, your workspace, and Git state; restores them under `/baton` in a Linux x86_64 Sandbox; and resumes Codex non-interactively. It is intentionally a handoff tool, not a live terminal connection or a PR bot.
 
@@ -59,7 +59,7 @@ When the remote work is complete, return to the same project and run:
 baton fetch
 ```
 
-Choose the detached handoff. Baton downloads a review copy without touching your working tree:
+Choose the detached handoff. Baton always saves a review artifact:
 
 ```text
 .baton/fetches/<sandbox-id>/
@@ -69,15 +69,15 @@ Choose the detached handoff. Baton downloads a review copy without touching your
 └── result.json     # sandbox/session metadata and Codex exit code
 ```
 
-Inspect `changes.patch` or compare `baseline/` with `workspace/`, then copy or apply the changes yourself. Baton never changes your local worktree during fetch, and it never creates a commit, pushes, or opens a PR.
+By default, Baton then applies the fetched patch to your current workspace. It first verifies that the portable source files—and, for Git projects, the checkout and index—still match the handoff baseline; if they do not, it refuses to overwrite anything and leaves this artifact in place for review. Baton never creates a commit, pushes, or opens a PR.
 
-To apply a reviewed patch manually, first ensure your local workspace has not drifted from the handoff baseline:
+Use `--no-apply` to download the artifact without changing your workspace:
 
 ```bash
-FETCH_ROOT=".baton/fetches/<sandbox-id>"
-git apply --check "$FETCH_ROOT/changes.patch"
-git apply "$FETCH_ROOT/changes.patch"
+baton fetch --no-apply
 ```
+
+If automatic application refuses because you continued working locally, inspect `changes.patch` or compare `baseline/` with `workspace/`; you can resolve the divergence and apply the patch yourself with Git.
 
 Add `.baton/` to the target project's `.gitignore`: snapshots contain source and transcripts and should stay local.
 
@@ -134,7 +134,7 @@ Explicit form:
 baton fetch <sandbox-id>
 ```
 
-The explicit form needs the matching local receipt (or `--receipt PATH`). Fetch checks for the remote completion marker and refuses to download a workspace that Codex may still be modifying; wait for Codex to finish and retry if the marker is absent. A nonzero remote Codex exit code is reported in `result.json`, but any files it changed remain available for review.
+The explicit form needs the matching local receipt (or `--receipt PATH`). Fetch checks for the remote completion marker and refuses to download a workspace that Codex may still be modifying; wait for Codex to finish and retry if the marker is absent. Once complete, it applies the result automatically only when the current portable workspace and Git state still match the handoff baseline. Pass `--no-apply` for review-only mode. A nonzero remote Codex exit code is reported in `result.json`; its files remain available for review, but Baton does not auto-apply a failed remote run.
 
 ## What Baton moves—and what it does not
 

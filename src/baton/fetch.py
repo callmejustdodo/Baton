@@ -1,4 +1,4 @@
-"""Safely retrieve a completed Modal Sandbox workspace for local review."""
+"""Retrieve a completed Modal Sandbox workspace and apply it when safe."""
 
 from __future__ import annotations
 
@@ -6,17 +6,23 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import UUID, uuid4
 
 from .handoff import HandoffError, inspect_snapshot_archive
-from .snapshot import KNOWN_SECRET_DIRECTORIES, KNOWN_SECRET_FILENAMES
+from .snapshot import (
+    EXCLUDED_PATH_COMPONENTS,
+    KNOWN_SECRET_DIRECTORIES,
+    KNOWN_SECRET_FILENAMES,
+)
 
 RECEIPT_FORMAT_VERSION = 1
 HANDOFF_RECEIPTS_DIRECTORY = Path(".baton") / "handoffs"
@@ -48,7 +54,7 @@ class HandoffReceipt:
 
 @dataclass(frozen=True)
 class FetchResult:
-    """A completed Sandbox workspace staged locally for review."""
+    """A completed Sandbox workspace staged locally, with optional local application."""
 
     sandbox_id: str
     archive: Path
@@ -58,6 +64,7 @@ class FetchResult:
     patch_path: Path
     changed_files: tuple[str, ...]
     remote_exit_code: int
+    applied: bool
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -69,7 +76,7 @@ class FetchResult:
             "patch_path": str(self.patch_path),
             "changed_files": list(self.changed_files),
             "remote_exit_code": self.remote_exit_code,
-            "applied": False,
+            "applied": self.applied,
         }
 
 
@@ -151,9 +158,15 @@ def fetch_workspace(
     workspace: Path,
     receipt_path: Path | None = None,
     output: Path | None = None,
+    apply_changes: bool = True,
     modal_module: Any | None = None,
 ) -> FetchResult:
-    """Download a completed Sandbox workspace without changing the worktree."""
+    """Fetch a completed Sandbox workspace and apply its patch by default.
+
+    The immutable handoff snapshot is compared with the local workspace before any
+    mutation.  If the project changed after handoff, application is refused and the
+    staged fetch artifact remains available for review.
+    """
 
     normalized_sandbox_id = _normalize_sandbox_id(sandbox_id)
     source_workspace = _existing_directory(workspace, "workspace")
@@ -184,6 +197,7 @@ def fetch_workspace(
     )
     remote_archive = f"/tmp/baton-fetch-{uuid4().hex}.tar.gz"
     primary_error: BaseException | None = None
+    remote_archive_removed = False
 
     try:
         baseline_workspace = staging_root / "baseline"
@@ -204,6 +218,10 @@ def fetch_workspace(
             "workspace",
         )
         sandbox.filesystem.copy_to_local(remote_archive, downloaded_archive)
+        cleanup_error = _remove_remote_archive(sandbox, remote_archive)
+        if cleanup_error is not None:
+            raise cleanup_error
+        remote_archive_removed = True
         _extract_workspace_tarball(downloaded_archive, remote_workspace)
         downloaded_archive.unlink(missing_ok=True)
 
@@ -211,18 +229,7 @@ def fetch_workspace(
         patch_bytes = _build_patch(staging_root)
         patch_path.write_bytes(patch_bytes)
         changed_files = _collect_changed_files(patch_bytes)
-        _write_json_atomically(
-            staging_root / "result.json",
-            {
-                "sandbox_id": normalized_sandbox_id,
-                "session_id": receipt.session_id,
-                "archive": str(receipt.archive),
-                "remote_exit_code": remote_exit_code,
-                "changed_files": list(changed_files),
-            },
-        )
-        os.replace(staging_root, fetch_root)
-        return FetchResult(
+        result = FetchResult(
             sandbox_id=normalized_sandbox_id,
             archive=receipt.archive,
             fetch_root=fetch_root,
@@ -231,7 +238,74 @@ def fetch_workspace(
             patch_path=fetch_root / "changes.patch",
             changed_files=changed_files,
             remote_exit_code=remote_exit_code,
+            applied=False,
         )
+        should_apply = apply_changes and remote_exit_code == 0
+        _write_fetch_result(
+            staging_root / "result.json",
+            result,
+            receipt.session_id,
+            applied=None if should_apply else False,
+            apply_status=(
+                "pending"
+                if should_apply
+                else "review_only" if not apply_changes else "remote_exit_nonzero"
+            ),
+        )
+        os.replace(staging_root, fetch_root)
+
+        if not should_apply:
+            return result
+
+        try:
+            _apply_workspace_patch(
+                source_workspace,
+                result.baseline_workspace,
+                result.patch_path,
+                snapshot_archive=receipt.archive,
+                ignored_paths=(fetch_root,),
+            )
+        except FetchError as error:
+            try:
+                _write_fetch_result(
+                    fetch_root / "result.json",
+                    result,
+                    receipt.session_id,
+                    applied=False,
+                    apply_status="apply_failed",
+                )
+            except OSError:
+                pass
+            raise FetchError(
+                "remote changes were fetched to "
+                f"{fetch_root} but were not applied: {error}"
+            ) from error
+        result = FetchResult(
+            sandbox_id=result.sandbox_id,
+            archive=result.archive,
+            fetch_root=result.fetch_root,
+            baseline_workspace=result.baseline_workspace,
+            remote_workspace=result.remote_workspace,
+            patch_path=result.patch_path,
+            changed_files=result.changed_files,
+            remote_exit_code=result.remote_exit_code,
+            applied=True,
+        )
+        try:
+            _write_fetch_result(
+                fetch_root / "result.json",
+                result,
+                receipt.session_id,
+                applied=True,
+                apply_status="applied",
+            )
+        except OSError as error:
+            raise FetchError(
+                f"remote changes were applied to {source_workspace}, but Baton could not "
+                f"update {fetch_root / 'result.json'}: {error}. Do not rerun fetch; inspect "
+                "the workspace and saved artifact instead."
+            ) from error
+        return result
     except FetchError as error:
         primary_error = error
         raise
@@ -243,7 +317,11 @@ def fetch_workspace(
         primary_error = error
         raise
     finally:
-        cleanup_error = _remove_remote_archive(sandbox, remote_archive)
+        cleanup_error = (
+            None
+            if remote_archive_removed
+            else _remove_remote_archive(sandbox, remote_archive)
+        )
         if staging_root.exists():
             shutil.rmtree(staging_root)
         if cleanup_error is not None:
@@ -503,6 +581,265 @@ def _collect_changed_files(patch: bytes) -> tuple[str, ...]:
         if candidate and candidate not in changed:
             changed.append(candidate)
     return tuple(changed)
+
+
+def _write_fetch_result(
+    path: Path,
+    result: FetchResult,
+    session_id: str,
+    *,
+    applied: bool | None,
+    apply_status: str,
+) -> None:
+    _write_json_atomically(
+        path,
+        {
+            "session_id": session_id,
+            **result.to_dict(),
+            "applied": applied,
+            "apply_status": apply_status,
+        },
+    )
+
+
+def _apply_workspace_patch(
+    workspace: Path,
+    baseline_workspace: Path,
+    patch_path: Path,
+    *,
+    snapshot_archive: Path | None = None,
+    ignored_paths: tuple[Path, ...] = (),
+) -> None:
+    """Apply a prepared patch only when the local handoff baseline still matches."""
+
+    _assert_workspace_matches_baseline(
+        workspace,
+        baseline_workspace,
+        snapshot_archive=snapshot_archive,
+        ignored_paths=ignored_paths,
+    )
+    if patch_path.stat().st_size == 0:
+        return
+
+    command = ["git", "-C", str(workspace), "apply", "--binary"]
+    if not (workspace / ".git").exists():
+        command.append("--no-index")
+    command.append(str(patch_path))
+    try:
+        result = subprocess.run(command, capture_output=True, check=False)
+    except FileNotFoundError as error:
+        raise FetchError("Git is required to apply fetched changes") from error
+    if result.returncode == 0:
+        return
+
+    detail = result.stderr.decode("utf-8", errors="replace").strip()
+    if not detail:
+        detail = result.stdout.decode("utf-8", errors="replace").strip()
+    raise FetchError(f"could not apply the remote patch: {detail or 'no command output'}")
+
+
+def _assert_workspace_matches_baseline(
+    workspace: Path,
+    baseline_workspace: Path,
+    *,
+    snapshot_archive: Path | None,
+    ignored_paths: tuple[Path, ...],
+) -> None:
+    """Reject auto-apply when portable workspace content changed after handoff."""
+
+    if _workspace_fingerprint(workspace, ignored_paths=ignored_paths) != _workspace_fingerprint(
+        baseline_workspace
+    ):
+        raise FetchError(
+            "local workspace changed since the handoff baseline; refusing to overwrite it. "
+            "Inspect the saved fetch artifact instead."
+        )
+    if snapshot_archive is not None:
+        _assert_git_state_matches_snapshot(workspace, snapshot_archive)
+
+
+def _workspace_fingerprint(
+    workspace: Path,
+    *,
+    ignored_paths: tuple[Path, ...] = (),
+) -> dict[str, tuple[object, ...]]:
+    """Match the snapshot's portable-content boundary without following symlinks."""
+
+    fingerprint: dict[str, tuple[object, ...]] = {}
+    for root, dirnames, filenames in os.walk(workspace, topdown=True, followlinks=False):
+        root_path = Path(root)
+        retained_directories: list[str] = []
+        for dirname in dirnames:
+            candidate = root_path / dirname
+            relative_path = candidate.relative_to(workspace)
+            if _is_snapshot_excluded(relative_path) or _is_ignored_workspace_path(
+                candidate, ignored_paths
+            ):
+                continue
+            if candidate.is_symlink():
+                fingerprint[f"symlink:{relative_path.as_posix()}"] = _workspace_entry_signature(
+                    candidate
+                )
+            else:
+                retained_directories.append(dirname)
+        dirnames[:] = retained_directories
+
+        for filename in filenames:
+            candidate = root_path / filename
+            relative_path = candidate.relative_to(workspace)
+            if _is_snapshot_excluded(relative_path) or _is_ignored_workspace_path(
+                candidate, ignored_paths
+            ):
+                continue
+            fingerprint[f"entry:{relative_path.as_posix()}"] = _workspace_entry_signature(candidate)
+    return fingerprint
+
+
+def _is_snapshot_excluded(relative_path: Path) -> bool:
+    return any(
+        component in EXCLUDED_PATH_COMPONENTS
+        or component.endswith(".egg-info")
+        or (component.startswith(".env") and component != ".env.example")
+        for component in relative_path.parts
+    )
+
+
+def _is_ignored_workspace_path(path: Path, ignored_paths: tuple[Path, ...]) -> bool:
+    return any(_path_is_within(path, ignored_path) for ignored_path in ignored_paths)
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _workspace_entry_signature(path: Path) -> tuple[object, ...]:
+    metadata = path.lstat()
+    mode = stat.S_IMODE(metadata.st_mode)
+    if stat.S_ISLNK(metadata.st_mode):
+        return ("symlink", os.readlink(path), mode)
+    if stat.S_ISREG(metadata.st_mode):
+        digest = sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return ("file", digest.hexdigest(), mode)
+    return ("other", mode)
+
+
+def _assert_git_state_matches_snapshot(workspace: Path, snapshot_archive: Path) -> None:
+    """Keep auto-apply on the same Git checkout and index captured at handoff."""
+
+    try:
+        repository = inspect_snapshot_archive(snapshot_archive).repository
+    except HandoffError as error:
+        raise FetchError(f"could not verify the handoff Git state: {error}") from error
+    expected_repository = repository.get("present")
+    if not isinstance(expected_repository, bool):
+        raise FetchError("handoff snapshot has invalid Git metadata")
+
+    git_path = workspace / ".git"
+    if not expected_repository:
+        if git_path.exists() or git_path.is_symlink():
+            raise FetchError(
+                "the local workspace is now a Git repository, but the handoff snapshot was not; "
+                "refusing to apply onto a different Git state"
+            )
+        return
+    if not git_path.exists() and not git_path.is_symlink():
+        raise FetchError(
+            "the handoff snapshot was a Git repository, but the local workspace is not; "
+            "refusing to apply onto a different Git state"
+        )
+
+    repository_root = _require_local_git_output(workspace, "rev-parse", "--show-toplevel")
+    if Path(repository_root.decode("utf-8").strip()).resolve() != workspace:
+        raise FetchError("local workspace is no longer the Git worktree root from the handoff")
+
+    expected_head = repository.get("head")
+    if not isinstance(expected_head, str) or not expected_head:
+        raise FetchError("handoff snapshot has no Git HEAD to verify")
+    current_head = _require_local_git_output(workspace, "rev-parse", "HEAD").decode(
+        "utf-8"
+    ).strip()
+    if current_head != expected_head:
+        raise FetchError("local Git HEAD changed since handoff; refusing to apply remote changes")
+
+    expected_branch = repository.get("branch")
+    if expected_branch is not None and not isinstance(expected_branch, str):
+        raise FetchError("handoff snapshot has invalid Git branch metadata")
+    current_branch = _optional_local_git_output(workspace, "branch", "--show-current")
+    if current_branch != expected_branch:
+        raise FetchError("local Git branch changed since handoff; refusing to apply remote changes")
+
+    expected_staged = _read_snapshot_git_artifact(snapshot_archive, "git/staged.patch")
+    current_staged = _require_local_git_output(
+        workspace,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--cached",
+        "--root",
+    )
+    if current_staged != expected_staged:
+        raise FetchError("local Git index changed since handoff; refusing to apply remote changes")
+
+    expected_unstaged = _read_snapshot_git_artifact(snapshot_archive, "git/unstaged.patch")
+    current_unstaged = _require_local_git_output(
+        workspace,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+    )
+    if current_unstaged != expected_unstaged:
+        raise FetchError("local Git worktree changed since handoff; refusing to apply remote changes")
+
+
+def _read_snapshot_git_artifact(archive_path: Path, member_name: str) -> bytes:
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            source = archive.extractfile(member_name)
+            if source is None:
+                raise FetchError(f"handoff snapshot is missing {member_name}")
+            with source:
+                return source.read()
+    except (OSError, tarfile.TarError) as error:
+        raise FetchError(f"could not read handoff Git metadata: {error}") from error
+
+
+def _require_local_git_output(workspace: Path, *arguments: str) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), *arguments],
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise FetchError("Git is required to verify and apply fetched changes") from error
+    if result.returncode == 0:
+        return result.stdout
+    detail = result.stderr.decode("utf-8", errors="replace").strip()
+    raise FetchError(
+        f"could not verify local Git state ({' '.join(arguments)}): {detail or 'no command output'}"
+    )
+
+
+def _optional_local_git_output(workspace: Path, *arguments: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), *arguments],
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise FetchError("Git is required to verify and apply fetched changes") from error
+    if result.returncode != 0:
+        return None
+    value = result.stdout.decode("utf-8", errors="replace").strip()
+    return value or None
 
 
 def _remove_remote_archive(sandbox: Any, path: str) -> FetchError | None:

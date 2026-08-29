@@ -147,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     fetch_parser = subcommands.add_parser(
         "fetch",
-        help="download a completed Modal Sandbox workspace for safe local review",
+        help="download and safely apply a completed Modal Sandbox workspace",
     )
     fetch_parser.add_argument(
         "sandbox_id",
@@ -168,7 +168,14 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_parser.add_argument(
         "--output",
         type=Path,
-        help="review directory (default: <workspace>/.baton/fetches/<sandbox-id>)",
+        help="fetch artifact directory (default: <workspace>/.baton/fetches/<sandbox-id>)",
+    )
+    fetch_parser.add_argument(
+        "--no-apply",
+        dest="apply_changes",
+        action="store_false",
+        default=True,
+        help="download the fetched result for review without changing the workspace",
     )
     return parser
 
@@ -251,6 +258,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 workspace=args.workspace,
                 receipt_path=receipt_path,
                 output=args.output,
+                apply_changes=args.apply_changes,
             )
         except PickerCancelled:
             print("Baton: selection cancelled", file=sys.stderr)

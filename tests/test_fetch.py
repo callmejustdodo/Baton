@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from baton.fetch import FetchError, fetch_workspace, list_handoff_receipts
+import baton.fetch as fetch_module
+from baton.fetch import (
+    FetchError,
+    FetchResult,
+    _apply_workspace_patch,
+    fetch_workspace,
+    list_handoff_receipts,
+)
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
 SANDBOX_ID = "sb-fetch-test"
@@ -107,17 +116,17 @@ class FetchTests(unittest.TestCase):
         )
 
         self.assertEqual(result.remote_exit_code, 2)
+        self.assertFalse(result.applied)
+        self.assertEqual((self.workspace / "app.py").read_text(), "print('local')\n")
         self.assertEqual(len(modal.sandbox.filesystem.copy_calls), 1)
 
-    def test_successful_fetch_is_review_only_and_has_no_modal_lifecycle_side_effects(self) -> None:
+    def test_successful_fetch_applies_added_modified_and_deleted_files(self) -> None:
         modal = _FakeModal(
             {
                 "workspace/app.py": b"print('remote')\n",
-                "workspace/keep.txt": b"unchanged\n",
                 "workspace/new.txt": b"fresh\n",
             }
         )
-        original_app = (self.workspace / "app.py").read_bytes()
 
         result = fetch_workspace(
             sandbox_id=SANDBOX_ID,
@@ -135,8 +144,13 @@ class FetchTests(unittest.TestCase):
             "diff --git a/new.txt b/new.txt",
             result.patch_path.read_text(encoding="utf-8"),
         )
-        self.assertEqual((self.workspace / "app.py").read_bytes(), original_app)
-        self.assertFalse((self.workspace / "new.txt").exists())
+        self.assertTrue(result.applied)
+        self.assertTrue(result.to_dict()["applied"])
+        persisted_result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+        self.assertTrue(persisted_result["applied"])
+        self.assertEqual((self.workspace / "app.py").read_text(), "print('remote')\n")
+        self.assertEqual((self.workspace / "new.txt").read_text(), "fresh\n")
+        self.assertFalse((self.workspace / "keep.txt").exists())
         self.assertEqual(modal.Sandbox.from_id_calls, [SANDBOX_ID])
         self.assertEqual(modal.sandbox.filesystem.read_calls, [COMPLETION_PATH])
         self.assertEqual(modal.Sandbox.create_calls, [])
@@ -144,6 +158,266 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(modal.secret_calls, [])
         self.assertFalse(modal.sandbox.terminated)
         self.assertFalse(modal.sandbox.detached)
+
+    def test_fetch_with_apply_changes_false_leaves_workspace_unchanged(self) -> None:
+        modal = _FakeModal(
+            {
+                "workspace/app.py": b"print('remote')\n",
+                "workspace/new.txt": b"fresh\n",
+            }
+        )
+
+        result = fetch_workspace(
+            sandbox_id=SANDBOX_ID,
+            workspace=self.workspace,
+            receipt_path=self.receipt,
+            modal_module=modal,
+            apply_changes=False,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertFalse(result.to_dict()["applied"])
+        self.assertEqual((self.workspace / "app.py").read_text(), "print('local')\n")
+        self.assertEqual((self.workspace / "keep.txt").read_text(), "unchanged\n")
+        self.assertFalse((self.workspace / "new.txt").exists())
+
+    def test_custom_output_inside_workspace_does_not_count_as_local_drift(self) -> None:
+        modal = _FakeModal({"workspace/app.py": b"print('remote')\n"})
+        output = self.workspace / "review-output"
+
+        result = fetch_workspace(
+            sandbox_id=SANDBOX_ID,
+            workspace=self.workspace,
+            receipt_path=self.receipt,
+            output=output,
+            modal_module=modal,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.fetch_root, output.resolve())
+        self.assertEqual((self.workspace / "app.py").read_text(), "print('remote')\n")
+
+    def test_empty_remote_diff_is_a_successful_no_op(self) -> None:
+        modal = _FakeModal(
+            {
+                "workspace/app.py": b"print('local')\n",
+                "workspace/keep.txt": b"unchanged\n",
+            }
+        )
+        before = _workspace_files(self.workspace)
+
+        result = fetch_workspace(
+            sandbox_id=SANDBOX_ID,
+            workspace=self.workspace,
+            receipt_path=self.receipt,
+            modal_module=modal,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.patch_path.read_bytes(), b"")
+        self.assertEqual(_workspace_files(self.workspace), before)
+
+    def test_fetch_refuses_local_drift_before_changing_workspace(self) -> None:
+        modal = _FakeModal({"workspace/app.py": b"print('remote')\n"})
+        (self.workspace / "app.py").write_text("print('newer local edit')\n")
+        before = _workspace_files(self.workspace)
+
+        with self.assertRaisesRegex(FetchError, "local|drift|changed|baseline|conflict"):
+            fetch_workspace(
+                sandbox_id=SANDBOX_ID,
+                workspace=self.workspace,
+                receipt_path=self.receipt,
+                modal_module=modal,
+            )
+
+        self.assertEqual(_workspace_files(self.workspace), before)
+        result_payload = json.loads(
+            (self.workspace / ".baton/fetches" / SANDBOX_ID / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(result_payload["applied"])
+        self.assertEqual(result_payload["apply_status"], "apply_failed")
+
+    def test_apply_failure_leaves_workspace_unchanged(self) -> None:
+        modal = _FakeModal(
+            {
+                "workspace/app.py": b"print('remote')\n",
+                "workspace/new.txt": b"fresh\n",
+            }
+        )
+        before = _workspace_files(self.workspace)
+
+        with (
+            patch(
+                "baton.fetch._apply_workspace_patch",
+                side_effect=FetchError("injected apply failure"),
+            ),
+            self.assertRaisesRegex(FetchError, "apply|injected apply failure"),
+        ):
+            fetch_workspace(
+                sandbox_id=SANDBOX_ID,
+                workspace=self.workspace,
+                receipt_path=self.receipt,
+                modal_module=modal,
+            )
+
+        self.assertEqual(_workspace_files(self.workspace), before)
+        result_payload = json.loads(
+            (self.workspace / ".baton/fetches" / SANDBOX_ID / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(result_payload["applied"])
+        self.assertEqual(result_payload["apply_status"], "apply_failed")
+
+    def test_post_apply_metadata_failure_reports_that_changes_were_applied(self) -> None:
+        modal = _FakeModal({"workspace/app.py": b"print('remote')\n"})
+        original_write = fetch_module._write_fetch_result
+        write_calls = 0
+
+        def fail_final_write(
+            path: Path,
+            result: FetchResult,
+            session_id: str,
+            *,
+            applied: bool | None,
+            apply_status: str,
+        ) -> None:
+            nonlocal write_calls
+            write_calls += 1
+            if write_calls == 2:
+                raise OSError("disk full")
+            original_write(
+                path,
+                result,
+                session_id,
+                applied=applied,
+                apply_status=apply_status,
+            )
+
+        with (
+            patch("baton.fetch._write_fetch_result", side_effect=fail_final_write),
+            self.assertRaisesRegex(FetchError, "were applied|Do not rerun"),
+        ):
+            fetch_workspace(
+                sandbox_id=SANDBOX_ID,
+                workspace=self.workspace,
+                receipt_path=self.receipt,
+                modal_module=modal,
+            )
+
+        result_path = self.workspace / ".baton/fetches" / SANDBOX_ID / "result.json"
+        result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertIsNone(result_payload["applied"])
+        self.assertEqual(result_payload["apply_status"], "pending")
+        self.assertEqual((self.workspace / "app.py").read_text(), "print('remote')\n")
+
+    def test_git_index_drift_is_rejected_before_auto_apply(self) -> None:
+        _git(self.workspace, "init")
+        _git(self.workspace, "config", "user.email", "baton@example.test")
+        _git(self.workspace, "config", "user.name", "Baton Test")
+        _git(self.workspace, "add", "app.py", "keep.txt")
+        _git(self.workspace, "commit", "-m", "baseline")
+        _write_git_snapshot(self.snapshot, self.workspace)
+        (self.workspace / "app.py").write_text("print('staged')\n", encoding="utf-8")
+        _git(self.workspace, "add", "app.py")
+        (self.workspace / "app.py").write_text("print('local')\n", encoding="utf-8")
+        modal = _FakeModal({"workspace/app.py": b"print('remote')\n"})
+
+        with self.assertRaisesRegex(FetchError, "Git index changed"):
+            fetch_workspace(
+                sandbox_id=SANDBOX_ID,
+                workspace=self.workspace,
+                receipt_path=self.receipt,
+                modal_module=modal,
+            )
+
+        self.assertEqual((self.workspace / "app.py").read_text(), "print('local')\n")
+
+    def test_matching_git_workspace_auto_applies_without_changing_its_index(self) -> None:
+        _git(self.workspace, "init")
+        _git(self.workspace, "config", "user.email", "baton@example.test")
+        _git(self.workspace, "config", "user.name", "Baton Test")
+        _git(self.workspace, "add", "app.py", "keep.txt")
+        _git(self.workspace, "commit", "-m", "baseline")
+        _write_git_snapshot(self.snapshot, self.workspace)
+        modal = _FakeModal(
+            {
+                "workspace/app.py": b"print('remote')\n",
+                "workspace/keep.txt": b"unchanged\n",
+                "workspace/new.txt": b"fresh\n",
+            }
+        )
+
+        result = fetch_workspace(
+            sandbox_id=SANDBOX_ID,
+            workspace=self.workspace,
+            receipt_path=self.receipt,
+            modal_module=modal,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertEqual((self.workspace / "app.py").read_text(), "print('remote')\n")
+        self.assertEqual((self.workspace / "new.txt").read_text(), "fresh\n")
+        self.assertEqual(_git(self.workspace, "diff", "--cached").stdout, b"")
+
+    def test_matching_dirty_git_workspace_auto_applies_without_rewriting_its_index(self) -> None:
+        _git(self.workspace, "init")
+        _git(self.workspace, "config", "user.email", "baton@example.test")
+        _git(self.workspace, "config", "user.name", "Baton Test")
+        _git(self.workspace, "add", "app.py", "keep.txt")
+        _git(self.workspace, "commit", "-m", "baseline")
+        (self.workspace / "app.py").write_text("print('staged')\n", encoding="utf-8")
+        _git(self.workspace, "add", "app.py")
+        (self.workspace / "keep.txt").write_text("unstaged\n", encoding="utf-8")
+        _write_git_snapshot(self.snapshot, self.workspace)
+        staged_before = _git(self.workspace, "diff", "--cached", "--binary", "--root").stdout
+        modal = _FakeModal(
+            {
+                "workspace/app.py": b"print('remote staged')\n",
+                "workspace/keep.txt": b"remote unstaged\n",
+            }
+        )
+
+        result = fetch_workspace(
+            sandbox_id=SANDBOX_ID,
+            workspace=self.workspace,
+            receipt_path=self.receipt,
+            modal_module=modal,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertEqual((self.workspace / "app.py").read_text(), "print('remote staged')\n")
+        self.assertEqual((self.workspace / "keep.txt").read_text(), "remote unstaged\n")
+        self.assertEqual(_git(self.workspace, "diff", "--cached", "--binary", "--root").stdout, staged_before)
+
+    def test_changed_directory_symlink_is_rejected_before_it_can_escape_workspace(self) -> None:
+        baseline = self.root / "baseline"
+        baseline.mkdir()
+        (baseline / "nested").mkdir()
+        (baseline / "nested/file.txt").write_text("baseline\n", encoding="utf-8")
+        workspace = self.root / "symlink-workspace"
+        workspace.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "file.txt").write_text("outside\n", encoding="utf-8")
+        (workspace / "nested").symlink_to(outside, target_is_directory=True)
+        patch_path = self.root / "changes.patch"
+        patch_path.write_text(
+            "diff --git a/nested/file.txt b/nested/file.txt\n"
+            "--- a/nested/file.txt\n"
+            "+++ b/nested/file.txt\n"
+            "@@ -1 +1 @@\n"
+            "-baseline\n"
+            "+remote\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(FetchError, "local workspace changed"):
+            _apply_workspace_patch(workspace, baseline, patch_path)
+
+        self.assertEqual((outside / "file.txt").read_text(), "outside\n")
 
     def test_unsafe_tar_path_is_rejected_without_finalizing_output(self) -> None:
         modal = _FakeModal({"../outside.txt": b"escape"})
@@ -211,6 +485,14 @@ class _Process:
 
     def wait(self) -> int:
         return 0
+
+
+def _workspace_files(workspace: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(workspace).as_posix(): path.read_bytes()
+        for path in workspace.rglob("*")
+        if path.is_file() and ".baton" not in path.relative_to(workspace).parts
+    }
 
 
 class _Filesystem:
@@ -314,6 +596,54 @@ def _write_snapshot(path: Path) -> None:
         "workspace/keep.txt": b"unchanged\n",
     }
     path.write_bytes(_tar_bytes(members))
+
+
+def _write_git_snapshot(path: Path, workspace: Path) -> None:
+    head = _git(workspace, "rev-parse", "HEAD").stdout.decode("utf-8").strip()
+    branch = _git(workspace, "branch", "--show-current").stdout.decode("utf-8").strip()
+    staged = _git(
+        workspace,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--cached",
+        "--root",
+    ).stdout
+    unstaged = _git(workspace, "diff", "--binary", "--no-ext-diff").stdout
+    rollout = f"codex/sessions/2026/08/23/rollout-{SESSION_ID}.jsonl"
+    manifest = {
+        "format_version": 1,
+        "session": {"id": SESSION_ID, "rollout_archive_path": rollout},
+        "repository": {
+            "present": True,
+            "head": head,
+            "branch": branch or None,
+            "bundle_archive_path": "git/repository.bundle",
+            "artifacts": [
+                "git/repository.bundle",
+                "git/staged.patch",
+                "git/unstaged.patch",
+            ],
+        },
+    }
+    members = {
+        "manifest.json": json.dumps(manifest).encode(),
+        rollout: json.dumps({"payload": {"session_id": SESSION_ID}}).encode() + b"\n",
+        "workspace/app.py": (workspace / "app.py").read_bytes(),
+        "workspace/keep.txt": (workspace / "keep.txt").read_bytes(),
+        "git/repository.bundle": b"test bundle",
+        "git/staged.patch": staged,
+        "git/unstaged.patch": unstaged,
+    }
+    path.write_bytes(_tar_bytes(members))
+
+
+def _git(workspace: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(workspace), *arguments],
+        capture_output=True,
+        check=True,
+    )
 
 
 def _tar_bytes(members: dict[str, bytes]) -> bytes:

@@ -123,8 +123,21 @@ class CliPickerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(fetch_mock.call_args.kwargs["sandbox_id"], SANDBOX_ID)
         self.assertIsNone(fetch_mock.call_args.kwargs["receipt_path"])
+        self.assertTrue(fetch_mock.call_args.kwargs["apply_changes"])
         receipts_mock.assert_not_called()
         picker_mock.assert_not_called()
+
+    def test_fetch_no_apply_keeps_review_only_mode(self) -> None:
+        with (
+            patch("baton.cli.fetch_workspace", return_value=self.fetch_result) as fetch_mock,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main(
+                ["fetch", SANDBOX_ID, "--workspace", str(self.workspace), "--no-apply"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(fetch_mock.call_args.kwargs["apply_changes"])
 
     def test_fetch_without_id_selects_a_receipt_and_passes_its_exact_path(self) -> None:
         receipt = HandoffReceipt(
