@@ -1,0 +1,19 @@
+# Baton snapshots contain Codex transcripts and must remain local.
+.baton/
+
+# Local agent/runtime state.
+.omc/
+.omx/
+
+# Python build and cache output.
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Credentials and machine-local files.
+.env
+.env.*
+!.env.example
+.DS_Store
