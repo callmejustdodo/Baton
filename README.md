@@ -160,3 +160,7 @@ The snapshot contains the selected Codex rollout, its matching session-index rec
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
+
+## License
+
+Baton is released under the [MIT License](LICENSE).

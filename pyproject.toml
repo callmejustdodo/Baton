@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "baton"
 version = "0.1.0"
 description = "Snapshot a Codex session and its workspace for a remote handoff."
+license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
     "modal>=1.5.4",
@@ -13,6 +14,11 @@ dependencies = [
 
 [project.scripts]
 baton = "baton.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/callmejustdodo/Baton"
+Repository = "https://github.com/callmejustdodo/Baton"
+Issues = "https://github.com/callmejustdodo/Baton/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
