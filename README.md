@@ -1,5 +1,9 @@
 # Baton : you can close your macbook now
 
+We need to keep our MacBook open in agent era.
+
+![A laptop hands off an in-progress agent session to the cloud](assets/baton-handoff.png)
+
 Move an in-progress Codex session to a [Modal Sandbox](https://modal.com/docs/guide/sandboxes), then safely bring the completed remote work back.
 
 Baton snapshots the selected Codex rollout, your workspace, and Git state; restores them under `/baton` in a Linux x86_64 Sandbox; and resumes Codex non-interactively. It is intentionally a handoff tool, not a live terminal connection or a PR bot.
@@ -79,6 +83,16 @@ baton fetch --no-apply
 
 If automatic application refuses because you continued working locally, inspect `changes.patch` or compare `baseline/` with `workspace/`; you can resolve the divergence and apply the patch yourself with Git.
 
+After a successful fetch that applied its patch (the default), restore the remote conversation and reopen it in your local Codex TUI:
+
+```bash
+baton resume
+```
+
+Choose the same detached handoff. Baton downloads only that session's rollout and matching session-index record, verifies that the remote transcript extends the immutable handoff snapshot, backs up the local record under `.baton/session-backups/`, and starts `codex resume <session-id>` with your local `CODEX_HOME`. It never downloads the Sandbox's `auth.json`, global databases, plugins, logs, or other Codex runtime state. Run `baton resume --no-launch` when you only want to restore the conversation; then start it later with `codex resume <session-id>`.
+
+Fetch first: the restored conversation can refer to remote edits, while `baton resume` restores the conversation history only. Baton refuses to restore a remote session whose Codex command failed or whose local transcript advanced after handoff.
+
 Add `.baton/` to the target project's `.gitignore`: snapshots contain source and transcripts and should stay local.
 
 ## Commands
@@ -136,6 +150,22 @@ baton fetch <sandbox-id>
 
 The explicit form needs the matching local receipt (or `--receipt PATH`). Fetch checks for the remote completion marker and refuses to download a workspace that Codex may still be modifying; wait for Codex to finish and retry if the marker is absent. Once complete, it applies the result automatically only when the current portable workspace and Git state still match the handoff baseline. Pass `--no-apply` for review-only mode. A nonzero remote Codex exit code is reported in `result.json`; its files remain available for review, but Baton does not auto-apply a failed remote run.
 
+### `baton resume`
+
+Restore the completed remote conversation into your local Codex state and open it:
+
+```bash
+baton resume
+```
+
+Or pass the Sandbox ID explicitly:
+
+```bash
+baton resume <sandbox-id>
+```
+
+Like `fetch`, the explicit form needs the matching receipt (or `--receipt PATH`), and the picker is available only in an interactive terminal. `baton resume` requires a successful completed remote handoff plus its successfully applied fetch artifact, and will refuse to overwrite a locally advanced version of that session. It restores only the selected rollout plus the selected session-index record; it does not copy remote API-key auth or global Codex databases. Use `--no-launch` to restore without opening the local TUI, `--codex-home PATH` to restore into a non-default local Codex home, or `--fetch-root PATH` if you gave `baton fetch` a custom output directory.
+
 ## What Baton moves—and what it does not
 
 The snapshot contains the selected Codex rollout, its matching session-index record when available, the portable workspace, and Git provenance/deltas needed to recover local-only commits plus staged and unstaged changes.
@@ -143,7 +173,7 @@ The snapshot contains the selected Codex rollout, its matching session-index rec
 - Local Codex OAuth/auth files are excluded. The Sandbox receives `OPENAI_API_KEY` only through the named Modal Secret and uses `CODEX_HOME=/baton/.codex` inside the container.
 - Known credential paths such as `.env`, `.ssh`, `.aws`, and private key files are rejected. Still treat every snapshot as sensitive: ordinary source files and the transcript can contain secrets.
 - The laptop is commonly macOS arm64 while Modal is Linux x86_64. Baton excludes normal dependency/build directories such as `node_modules`, virtual environments, `build`, and `dist`; it rejects native artifacts or markers that remain (for example `binding.gyp`, `.so`, `.dylib`, and `.node`) rather than rebuilding them remotely.
-- The remote session's prose response is streamed to stdout only for an attached handoff. A detached fetch returns the workspace, not a copied Codex transcript. Ask the agent to write a report into the workspace if you need its summary later.
+- The remote session's prose response is streamed to stdout only for an attached handoff. For a detached handoff, `baton fetch` returns workspace changes and `baton resume` retrieves the selected completed conversation; no remote global Codex state is copied.
 
 ## Troubleshooting
 
@@ -154,6 +184,7 @@ The snapshot contains the selected Codex rollout, its matching session-index rec
 | Missing `OPENAI_API_KEY` Secret | Run `modal secret create baton-openai OPENAI_API_KEY="$OPENAI_API_KEY"`, then retry with the same Modal profile. |
 | Native dependency/build-output error | Remove generated/native outputs from the handoff scope; Baton will fail rather than rebuild across macOS arm64 and Linux x86_64. |
 | Fetch says the remote handoff has not completed | Wait for Codex to finish, then run `baton fetch` again. |
+| `baton resume` refuses the remote handoff | Fetch the workspace artifact for review. Baton restores sessions only after a successful remote Codex exit and never overwrites a locally advanced transcript. |
 
 ## Development
 
