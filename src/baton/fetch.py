@@ -1,4 +1,4 @@
-"""Retrieve a completed Modal Sandbox workspace and apply it when safe."""
+"""Retrieve a completed Runloop Devbox workspace and apply it when safe."""
 
 from __future__ import annotations
 
@@ -18,13 +18,14 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from .handoff import REMOTE_COMPLETION_MARKER, HandoffError, inspect_snapshot_archive
+from .runloop import RunloopClientError, load_runloop_client, open_devbox
 from .snapshot import (
     EXCLUDED_PATH_COMPONENTS,
     KNOWN_SECRET_DIRECTORIES,
     KNOWN_SECRET_FILENAMES,
 )
 
-RECEIPT_FORMAT_VERSION = 1
+RECEIPT_FORMAT_VERSION = 2
 HANDOFF_RECEIPTS_DIRECTORY = Path(".baton") / "handoffs"
 FETCHES_DIRECTORY = Path(".baton") / "fetches"
 REMOTE_ROOT = "/baton"
@@ -33,7 +34,7 @@ NATIVE_ARTIFACT_SUFFIXES = frozenset({".dll", ".dylib", ".node", ".pyd", ".so"})
 NATIVE_BUILD_COMPONENTS = frozenset({".venv", "build", "dist", "node_modules", "venv"})
 MAX_ARCHIVE_MEMBERS = 20_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
-SANDBOX_ID_PATTERN = re.compile(r"sb-[A-Za-z0-9_-]{1,128}\Z")
+DEVBOX_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
 class FetchError(RuntimeError):
@@ -42,10 +43,10 @@ class FetchError(RuntimeError):
 
 @dataclass(frozen=True)
 class HandoffReceipt:
-    """Local binding between a detached Sandbox and its immutable snapshot."""
+    """Local binding between a detached Devbox and its immutable snapshot."""
 
     path: Path
-    sandbox_id: str
+    devbox_id: str
     session_id: str
     archive: Path
     workspace: Path
@@ -53,9 +54,9 @@ class HandoffReceipt:
 
 @dataclass(frozen=True)
 class FetchResult:
-    """A completed Sandbox workspace staged locally, with optional local application."""
+    """A completed Devbox workspace staged locally, with optional local application."""
 
-    sandbox_id: str
+    devbox_id: str
     archive: Path
     fetch_root: Path
     baseline_workspace: Path
@@ -67,7 +68,7 @@ class FetchResult:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "sandbox_id": self.sandbox_id,
+            "devbox_id": self.devbox_id,
             "archive": str(self.archive),
             "fetch_root": str(self.fetch_root),
             "baseline_workspace": str(self.baseline_workspace),
@@ -81,14 +82,14 @@ class FetchResult:
 
 def write_handoff_receipt(
     *,
-    sandbox_id: str,
+    devbox_id: str,
     session_id: str,
     archive_path: Path,
     workspace: Path,
 ) -> Path:
     """Persist the immutable baseline needed by a later fetch."""
 
-    normalized_sandbox_id = _normalize_sandbox_id(sandbox_id)
+    normalized_devbox_id = _normalize_devbox_id(devbox_id)
     normalized_session_id = _normalize_session_id(session_id)
     source_workspace = _existing_directory(workspace, "workspace")
     try:
@@ -102,14 +103,14 @@ def write_handoff_receipt(
         source_workspace,
         HANDOFF_RECEIPTS_DIRECTORY,
     )
-    receipt_path = receipts_directory / f"{normalized_sandbox_id}.json"
+    receipt_path = receipts_directory / f"{normalized_devbox_id}.json"
     if receipt_path.exists() or receipt_path.is_symlink():
         raise FetchError(f"refusing to overwrite existing handoff receipt: {receipt_path}")
     _write_json_atomically(
         receipt_path,
         {
             "format_version": RECEIPT_FORMAT_VERSION,
-            "sandbox_id": normalized_sandbox_id,
+            "devbox_id": normalized_devbox_id,
             "session_id": normalized_session_id,
             "archive": str(snapshot.path),
             "workspace": str(source_workspace),
@@ -134,8 +135,8 @@ def list_handoff_receipts(*, workspace: Path) -> tuple[HandoffReceipt, ...]:
         try:
             if receipt_path.is_symlink():
                 continue
-            sandbox_id = _normalize_sandbox_id(receipt_path.stem)
-            receipt = _load_handoff_receipt(receipt_path, sandbox_id)
+            devbox_id = _normalize_devbox_id(receipt_path.stem)
+            receipt = _load_handoff_receipt(receipt_path, devbox_id)
             modified_at = receipt_path.stat().st_mtime_ns
         except (FetchError, OSError):
             continue
@@ -145,7 +146,7 @@ def list_handoff_receipts(*, workspace: Path) -> tuple[HandoffReceipt, ...]:
         receipt
         for _, receipt in sorted(
             receipts,
-            key=lambda entry: (entry[0], entry[1].sandbox_id),
+            key=lambda entry: (entry[0], entry[1].devbox_id),
             reverse=True,
         )
     )
@@ -153,43 +154,45 @@ def list_handoff_receipts(*, workspace: Path) -> tuple[HandoffReceipt, ...]:
 
 def fetch_workspace(
     *,
-    sandbox_id: str,
+    devbox_id: str,
     workspace: Path,
     receipt_path: Path | None = None,
     output: Path | None = None,
     apply_changes: bool = True,
-    modal_module: Any | None = None,
+    runloop_client: Any | None = None,
 ) -> FetchResult:
-    """Fetch a completed Sandbox workspace and apply its patch by default.
+    """Fetch a completed Devbox workspace and apply its patch by default.
 
     The immutable handoff snapshot is compared with the local workspace before any
     mutation.  If the project changed after handoff, application is refused and the
     staged fetch artifact remains available for review.
     """
 
-    normalized_sandbox_id = _normalize_sandbox_id(sandbox_id)
+    normalized_devbox_id = _normalize_devbox_id(devbox_id)
     source_workspace = _existing_directory(workspace, "workspace")
     resolved_receipt_path = (
         receipt_path.expanduser().resolve()
         if receipt_path is not None
         else _workspace_state_path(source_workspace, HANDOFF_RECEIPTS_DIRECTORY)
-        / f"{normalized_sandbox_id}.json"
+        / f"{normalized_devbox_id}.json"
     )
-    receipt = _load_handoff_receipt(resolved_receipt_path, normalized_sandbox_id)
+    receipt = _load_handoff_receipt(resolved_receipt_path, normalized_devbox_id)
     if receipt.workspace != source_workspace:
         raise FetchError(
             "handoff receipt belongs to a different workspace; fetch from the original "
             "workspace so its snapshot remains the comparison baseline"
         )
-    fetch_root = _resolve_fetch_output(source_workspace, normalized_sandbox_id, output)
+    fetch_root = _resolve_fetch_output(source_workspace, normalized_devbox_id, output)
 
-    modal = modal_module or _load_modal()
     try:
-        sandbox = modal.Sandbox.from_id(normalized_sandbox_id)
+        client = runloop_client if runloop_client is not None else load_runloop_client()
+        devbox = open_devbox(client, normalized_devbox_id)
+    except RunloopClientError as error:
+        raise FetchError(str(error)) from error
     except Exception as error:
-        raise FetchError(f"Modal Sandbox lookup failed: {error}") from error
+        raise FetchError(f"Runloop Devbox lookup failed: {error}") from error
 
-    remote_exit_code = _require_completion_marker(sandbox)
+    remote_exit_code = _require_completion_marker(devbox)
     fetch_root.parent.mkdir(parents=True, exist_ok=True)
     staging_root = Path(
         tempfile.mkdtemp(prefix=f".{fetch_root.name}-", dir=fetch_root.parent)
@@ -204,7 +207,7 @@ def fetch_workspace(
         downloaded_archive = staging_root / "remote-workspace.tar.gz"
         _extract_snapshot_workspace(receipt.archive, baseline_workspace)
         _run_checked(
-            sandbox,
+            devbox,
             "tar",
             "--exclude=workspace/.git",
             "--exclude=workspace/.baton",
@@ -216,8 +219,8 @@ def fetch_workspace(
             remote_archive,
             "workspace",
         )
-        sandbox.filesystem.copy_to_local(remote_archive, downloaded_archive)
-        cleanup_error = _remove_remote_archive(sandbox, remote_archive)
+        devbox.filesystem.copy_to_local(remote_archive, downloaded_archive)
+        cleanup_error = _remove_remote_archive(devbox, remote_archive)
         if cleanup_error is not None:
             raise cleanup_error
         remote_archive_removed = True
@@ -229,7 +232,7 @@ def fetch_workspace(
         patch_path.write_bytes(patch_bytes)
         changed_files = _collect_changed_files(patch_bytes)
         result = FetchResult(
-            sandbox_id=normalized_sandbox_id,
+            devbox_id=normalized_devbox_id,
             archive=receipt.archive,
             fetch_root=fetch_root,
             baseline_workspace=fetch_root / "baseline",
@@ -280,7 +283,7 @@ def fetch_workspace(
                 f"{fetch_root} but were not applied: {error}"
             ) from error
         result = FetchResult(
-            sandbox_id=result.sandbox_id,
+            devbox_id=result.devbox_id,
             archive=result.archive,
             fetch_root=result.fetch_root,
             baseline_workspace=result.baseline_workspace,
@@ -309,7 +312,7 @@ def fetch_workspace(
         primary_error = error
         raise
     except Exception as error:
-        fetch_error = FetchError(f"Modal fetch failed: {error}")
+        fetch_error = FetchError(f"Runloop fetch failed: {error}")
         primary_error = fetch_error
         raise fetch_error from error
     except BaseException as error:
@@ -319,7 +322,7 @@ def fetch_workspace(
         cleanup_error = (
             None
             if remote_archive_removed
-            else _remove_remote_archive(sandbox, remote_archive)
+            else _remove_remote_archive(devbox, remote_archive)
         )
         if staging_root.exists():
             shutil.rmtree(staging_root)
@@ -332,10 +335,10 @@ def fetch_workspace(
                 primary_error.add_note(str(cleanup_error))
 
 
-def _load_handoff_receipt(path: Path, sandbox_id: str) -> HandoffReceipt:
+def _load_handoff_receipt(path: Path, devbox_id: str) -> HandoffReceipt:
     if not path.is_file():
         raise FetchError(
-            "no handoff receipt found for this Sandbox. Run 'baton handoff --detach' "
+            "no handoff receipt found for this Devbox. Run 'baton handoff --detach' "
             "from this workspace first, or pass --receipt."
         )
     try:
@@ -344,8 +347,8 @@ def _load_handoff_receipt(path: Path, sandbox_id: str) -> HandoffReceipt:
         raise FetchError(f"handoff receipt is not valid JSON: {path}") from error
     if not isinstance(payload, Mapping) or payload.get("format_version") != RECEIPT_FORMAT_VERSION:
         raise FetchError(f"handoff receipt has an unsupported format: {path}")
-    if payload.get("sandbox_id") != sandbox_id:
-        raise FetchError("handoff receipt does not belong to the requested Sandbox")
+    if payload.get("devbox_id") != devbox_id:
+        raise FetchError("handoff receipt does not belong to the requested Devbox")
     session_id = _normalize_session_id(payload.get("session_id"))
     archive_value = payload.get("archive")
     workspace_value = payload.get("workspace")
@@ -361,19 +364,19 @@ def _load_handoff_receipt(path: Path, sandbox_id: str) -> HandoffReceipt:
         raise FetchError("handoff receipt session does not match its snapshot archive")
     return HandoffReceipt(
         path=path,
-        sandbox_id=sandbox_id,
+        devbox_id=devbox_id,
         session_id=session_id,
         archive=snapshot.path,
         workspace=receipt_workspace,
     )
 
 
-def _require_completion_marker(sandbox: Any) -> int:
+def _require_completion_marker(devbox: Any) -> int:
     try:
-        raw_marker = sandbox.filesystem.read_text(REMOTE_COMPLETION_MARKER)
+        raw_marker = devbox.filesystem.read_text(REMOTE_COMPLETION_MARKER)
     except Exception as error:
         raise FetchError(
-            "the remote handoff has not completed yet, or its Sandbox is unavailable; "
+            "the remote handoff has not completed yet, or its Devbox is unavailable; "
             "wait for Codex to finish before fetching"
         ) from error
     try:
@@ -491,7 +494,7 @@ def _reject_workspace_path(path: PurePosixPath) -> None:
     if _looks_like_secret_path(relative_parts):
         raise FetchError(
             "workspace archive contains a credential-like path: "
-            f"{path}. Runtime credentials must stay in Modal Secrets."
+            f"{path}. Runtime credentials must stay in Runloop Secrets."
         )
     if any(component in NATIVE_BUILD_COMPONENTS for component in relative_parts):
         raise FetchError(
@@ -841,16 +844,16 @@ def _optional_local_git_output(workspace: Path, *arguments: str) -> str | None:
     return value or None
 
 
-def _remove_remote_archive(sandbox: Any, path: str) -> FetchError | None:
+def _remove_remote_archive(devbox: Any, path: str) -> FetchError | None:
     try:
-        _run_checked(sandbox, "rm", "-f", path)
+        _run_checked(devbox, "rm", "-f", path)
     except FetchError as error:
         return FetchError(f"could not remove temporary remote fetch archive: {error}")
     return None
 
 
-def _run_checked(sandbox: Any, *command: str) -> str:
-    process = sandbox.exec(*command, timeout=120)
+def _run_checked(devbox: Any, *command: str) -> str:
+    process = devbox.exec(*command, timeout=120)
     stdout = _read_all(process.stdout)
     stderr = _read_all(process.stderr)
     process.wait()
@@ -864,10 +867,10 @@ def _run_checked(sandbox: Any, *command: str) -> str:
     return stdout
 
 
-def _resolve_fetch_output(workspace: Path, sandbox_id: str, output: Path | None) -> Path:
+def _resolve_fetch_output(workspace: Path, devbox_id: str, output: Path | None) -> Path:
     if output is None:
         fetches_directory = _workspace_state_directory(workspace, FETCHES_DIRECTORY)
-        destination = fetches_directory / sandbox_id
+        destination = fetches_directory / devbox_id
     else:
         destination = output.expanduser().resolve()
     if destination.exists() or destination.is_symlink():
@@ -964,10 +967,10 @@ def _existing_directory(path: Path, label: str) -> Path:
     return resolved
 
 
-def _normalize_sandbox_id(sandbox_id: str) -> str:
-    normalized = str(sandbox_id).strip()
-    if not SANDBOX_ID_PATTERN.fullmatch(normalized):
-        raise FetchError("sandbox ID must look like a Modal Sandbox ID (sb-...)")
+def _normalize_devbox_id(devbox_id: str) -> str:
+    normalized = str(devbox_id).strip()
+    if not DEVBOX_ID_PATTERN.fullmatch(normalized):
+        raise FetchError("Devbox ID must contain only letters, numbers, '-' or '_'")
     return normalized
 
 
@@ -990,11 +993,3 @@ def _process_returncode(process: Any) -> int:
     if not isinstance(returncode, int):
         raise FetchError("remote process did not report an exit code")
     return returncode
-
-
-def _load_modal() -> Any:
-    try:
-        import modal
-    except ImportError as error:
-        raise FetchError("Modal SDK is required; install Baton with its Modal dependency") from error
-    return modal
