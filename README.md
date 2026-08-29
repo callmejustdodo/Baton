@@ -49,7 +49,7 @@ Open a terminal in the project you want to hand off, then start a detached hando
 baton handoff "Continue the task. When finished, write a short summary to HANDOFF_RESULT.md." --detach
 ```
 
-Baton presents a numbered picker containing only Codex sessions whose recorded working directory matches the current project. Select the session, then you can close the laptop: the Modal Sandbox keeps working. The command prints a `sandbox_id`, the snapshot path, and a local handoff receipt.
+Baton presents a keyboard picker containing only Codex sessions whose recorded working directory matches the current project. Sessions are ordered by most recent rollout activity, with the newest first; use ↑/↓ to move and Enter to select. Then you can close the laptop: the Modal Sandbox keeps working. The command prints a `sandbox_id`, the snapshot path, and a local handoff receipt.
 
 Treat this as a checkpoint, not live process migration. Stop or wait for the local Codex turn before handoff, and do not let local and remote agents modify the same session/workspace concurrently. Baton detects changes during capture, but it cannot merge divergent work created afterward.
 
@@ -97,7 +97,7 @@ Explicit form (best for scripts or a known session):
 baton handoff <session-id> "Your follow-up prompt" --detach
 ```
 
-Press `q` in a picker to cancel. Non-interactive input deliberately requires the explicit form, so automation cannot accidentally choose a session.
+Use ↑/↓ and Enter in a picker; press `q` or Esc to cancel. Non-interactive input deliberately requires the explicit form, so automation cannot accidentally choose a session.
 
 Omit `--detach` to keep the local command attached. Baton streams Codex JSONL events to stdout and cleans up the Sandbox when the command finishes. Use `--detach` when you want the work to continue after the laptop sleeps; `baton fetch` needs the receipt created by a detached handoff.
 

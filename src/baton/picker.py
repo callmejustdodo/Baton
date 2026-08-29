@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -97,6 +99,7 @@ def choose_session(
         sessions,
         title="Select a Codex session to hand off:",
         render=_render_session,
+        ordering_hint="Most recently active session is first.",
         empty_message=(
             "no local Codex sessions are available; use "
             "'baton handoff <session-id> <prompt>' with an explicit session ID"
@@ -118,6 +121,7 @@ def choose_handoff(
         receipts,
         title="Select a detached Baton handoff to fetch:",
         render=_render_handoff,
+        ordering_hint="Most recently created handoff is first.",
         empty_message=(
             "no detached Baton handoffs are available in this workspace; run "
             "'baton handoff <session-id> <prompt> --detach' first"
@@ -132,6 +136,7 @@ def _choose(
     *,
     title: str,
     render: Callable[[_Choice], str],
+    ordering_hint: str,
     empty_message: str,
     input_stream: TextIO | None,
     output_stream: TextIO | None,
@@ -148,29 +153,155 @@ def _choose(
         )
 
     print(title, file=destination)
-    for number, choice in enumerate(choices, start=1):
-        print(f"  {number}. {render(choice)}", file=destination)
+    print(f"{ordering_hint} ↑/↓ move · Enter select · q or Esc cancel", file=destination)
+    choice_width = _choice_width(destination) if interactive_input else None
+    rendered_choices = tuple(
+        _truncate_terminal_line(render(choice), choice_width) for choice in choices
+    )
+    selection = 0
+    _draw_choices(destination, rendered_choices, selection)
 
-    while True:
-        try:
-            print("Select a number, or q to cancel: ", end="", file=destination, flush=True)
-            selected = source.readline()
-        except KeyboardInterrupt as error:
-            print(file=destination)
-            raise PickerCancelled("selection cancelled") from error
-        if selected == "":
-            raise PickerCancelled("selection cancelled")
-        normalized = selected.strip()
-        if normalized.lower() in {"q", "quit"}:
-            raise PickerCancelled("selection cancelled")
-        try:
-            selection = int(normalized)
-        except ValueError:
-            print("Enter a displayed number or q.", file=destination)
-            continue
-        if 1 <= selection <= len(choices):
-            return choices[selection - 1]
-        print(f"Enter a number from 1 to {len(choices)}, or q.", file=destination)
+    terminal_mode = _raw_terminal(source) if interactive_input else nullcontext()
+    try:
+        with terminal_mode:
+            while True:
+                key = _read_picker_key(source, raw_terminal=interactive_input)
+                if key == "enter":
+                    _finish_picker(destination)
+                    return choices[selection]
+                if key in {"cancel", "eof"}:
+                    _finish_picker(destination)
+                    raise PickerCancelled("selection cancelled")
+                next_selection = _move_selection(selection, key, len(choices))
+                if next_selection != selection:
+                    selection = next_selection
+                    _draw_choices(
+                        destination,
+                        rendered_choices,
+                        selection,
+                        redraw=True,
+                    )
+    except KeyboardInterrupt as error:
+        _finish_picker(destination)
+        raise PickerCancelled("selection cancelled") from error
+
+
+def _draw_choices(
+    destination: TextIO,
+    choices: Sequence[str],
+    selection: int,
+    *,
+    redraw: bool = False,
+) -> None:
+    if redraw:
+        destination.write(f"\x1b[{len(choices)}A")
+    for index, choice in enumerate(choices):
+        if redraw:
+            destination.write("\r\x1b[2K")
+        marker = ">" if index == selection else " "
+        destination.write(f"{marker} {choice}\n")
+    destination.flush()
+
+
+def _finish_picker(destination: TextIO) -> None:
+    destination.write("\n")
+    destination.flush()
+
+
+def _choice_width(destination: TextIO) -> int:
+    """Reserve two columns for the selection marker on an interactive terminal."""
+
+    try:
+        columns = os.get_terminal_size(destination.fileno()).columns
+    except (AttributeError, OSError):
+        columns = 80
+    return max(1, columns - 2)
+
+
+def _truncate_terminal_line(value: str, width: int | None) -> str:
+    if width is None or len(value) <= width:
+        return value
+    if width == 1:
+        return "…"
+    return f"{value[: width - 1]}…"
+
+
+def _move_selection(selection: int, key: str, count: int) -> int:
+    if key == "up":
+        return (selection - 1) % count
+    if key == "down":
+        return (selection + 1) % count
+    return selection
+
+
+def _read_picker_key(source: TextIO, *, raw_terminal: bool) -> str:
+    key = _read_key_byte(source, raw_terminal=raw_terminal)
+    if key == "":
+        return "eof"
+    if key in {"\r", "\n"}:
+        return "enter"
+    if key in {"q", "Q", "\x03", "\x04"}:
+        return "cancel"
+    if key != "\x1b":
+        return "ignore"
+    return _read_escape_sequence(source, raw_terminal=raw_terminal)
+
+
+def _read_escape_sequence(source: TextIO, *, raw_terminal: bool) -> str:
+    if raw_terminal and not _terminal_input_ready(source):
+        return "cancel"
+    prefix = _read_key_byte(source, raw_terminal=raw_terminal)
+    if prefix not in {"[", "O"}:
+        return "cancel" if prefix == "" else "ignore"
+    if raw_terminal and not _terminal_input_ready(source):
+        return "ignore"
+    suffix = _read_key_byte(source, raw_terminal=raw_terminal)
+    if suffix == "A":
+        return "up"
+    if suffix == "B":
+        return "down"
+    return "ignore"
+
+
+def _read_key_byte(source: TextIO, *, raw_terminal: bool) -> str:
+    """Read exactly one input byte, bypassing TextIO buffering in raw mode."""
+
+    if not raw_terminal:
+        return source.read(1)
+    try:
+        value = os.read(source.fileno(), 1)
+    except OSError as error:
+        raise PickerError("could not read keyboard input") from error
+    return value.decode("latin-1")
+
+
+def _terminal_input_ready(source: TextIO) -> bool:
+    try:
+        import select
+
+        readable, _, _ = select.select([source.fileno()], [], [], 0.05)
+    except (AttributeError, OSError):
+        return False
+    return bool(readable)
+
+
+@contextmanager
+def _raw_terminal(source: TextIO) -> Iterator[None]:
+    """Temporarily read one key at a time and always restore terminal settings."""
+
+    try:
+        import termios
+        import tty
+
+        file_descriptor = source.fileno()
+        original_settings = termios.tcgetattr(file_descriptor)
+    except (AttributeError, ImportError, OSError) as error:
+        raise PickerError("arrow-key selection needs a POSIX terminal") from error
+    try:
+        tty.setraw(file_descriptor)
+        yield
+    finally:
+        termios.tcsetattr(file_descriptor, termios.TCSADRAIN, original_settings)
 
 
 def _read_session_index(path: Path) -> dict[str, dict[str, object]]:
