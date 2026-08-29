@@ -19,6 +19,23 @@ Baton is a checkpoint-and-handoff tool, not a live terminal connection or a PR b
 3. **Fetch** — download the completed workspace and safely apply its changes when the local baseline still matches.
 4. **Resume** — restore the completed remote conversation into the local Codex TUI.
 
+## Built on Runloop
+
+Baton uses [Runloop Devboxes](https://docs.runloop.ai/docs/devboxes/overview) as
+its only remote runtime. `baton prepare` builds a reusable Linux x86_64
+[Blueprint](https://docs.runloop.ai/docs/devboxes/blueprints/overview) with Git
+and the matching Codex CLI already installed, so a handoff starts working instead
+of spending its cold start installing tools.
+
+For each handoff, Baton creates a Devbox, uploads the selected snapshot, and
+injects the Runloop account secret `BATON_OPENAI_API_KEY` as `OPENAI_API_KEY`.
+It never copies local Codex OAuth files. Codex runs as an unprivileged user with
+`CODEX_HOME=/baton/.codex`; Baton keeps completion metadata root-only.
+
+When Codex finishes, the Devbox suspends after five minutes of idle time. Its disk
+remains available for `baton fetch` and `baton resume`, which wake it again; shut
+the Devbox down in the Runloop dashboard after you have collected the work.
+
 ## Your first handoff
 
 After the one-time setup below, this is the whole loop. Run it from the project
