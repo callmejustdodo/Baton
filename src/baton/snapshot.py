@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
 import hashlib
 import io
 import json
 import os
-from pathlib import Path
 import platform
 import subprocess
 import tarfile
 import tempfile
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
-
 
 ARCHIVE_FORMAT_VERSION = 1
 EXCLUDED_PATH_COMPONENTS = frozenset(
@@ -105,8 +104,8 @@ def snapshot(
 
     The archive layout is the target layout: extract ``codex/`` into
     ``/baton/.codex`` and ``workspace/`` into ``/baton/workspace``. The actual
-    OpenAI credential is deliberately absent and must arrive through a Modal
-    Secret at restore time.
+    OpenAI credential is deliberately absent and must arrive through a Runloop
+    account secret at restore time.
     """
 
     normalized_session_id = _normalize_session_id(session_id)
@@ -295,7 +294,7 @@ def _reject_known_sensitive_paths(workspace: Path) -> None:
         formatted_paths = ", ".join(sorted(sensitive_paths))
         raise SnapshotError(
             "refusing to archive credential-like workspace paths: "
-            f"{formatted_paths}. Inject runtime credentials with a Modal Secret instead."
+            f"{formatted_paths}. Inject runtime credentials with a Runloop account secret instead."
         )
 
 

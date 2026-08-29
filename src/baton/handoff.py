@@ -35,6 +35,7 @@ REMOTE_GIT_BASELINE = f"{REMOTE_CONTROL_DIR}/handoff-git-baseline.json"
 REMOTE_COMPLETION_TEMP = f"{REMOTE_CONTROL_DIR}/handoff-complete.tmp"
 GIT_BUNDLE_ARCHIVE = "git/repository.bundle"
 SETUP_COMMAND_TIMEOUT = 120
+DEFAULT_IDLE_SUSPEND_SECONDS = 5 * 60
 NATIVE_ARTIFACT_SUFFIXES = frozenset({".dll", ".dylib", ".node", ".pyd", ".so"})
 NATIVE_BUILD_COMPONENTS = frozenset({".venv", "build", "dist", "node_modules", "venv"})
 
@@ -215,7 +216,7 @@ def handoff_archive(
     prompt: str,
     runloop_secret: str = DEFAULT_RUNLOOP_SECRET,
     blueprint_name: str = DEFAULT_RUNLOOP_BLUEPRINT,
-    devbox_timeout: int = 20 * 60,
+    idle_suspend_seconds: int = DEFAULT_IDLE_SUSPEND_SECONDS,
     command_timeout: int = 20 * 60,
     detach: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -233,7 +234,7 @@ def handoff_archive(
         prompt,
         skip_git_repo_check=not snapshot.repository["present"],
     )
-    _validate_timeout("Devbox timeout", devbox_timeout)
+    _validate_timeout("Devbox idle suspend time", idle_suspend_seconds)
     _validate_timeout("command timeout", command_timeout)
     _require_nonempty_label("Runloop Blueprint name", blueprint_name)
     _require_nonempty_label("Runloop Secret name", runloop_secret)
@@ -245,7 +246,7 @@ def handoff_archive(
             blueprint_name=blueprint_name,
             secret_name=runloop_secret,
             name=f"baton-{snapshot.session_id[:8]}",
-            keep_alive_seconds=devbox_timeout,
+            idle_suspend_seconds=idle_suspend_seconds,
         )
     except RunloopClientError as error:
         raise HandoffError(str(error)) from error
@@ -292,11 +293,13 @@ def handoff_archive(
                 "-u",
                 REMOTE_RUNTIME_USER,
                 "--",
+                "timeout",
+                "--preserve-status",
+                str(command_timeout),
                 "env",
                 "HOME=/home/baton-agent",
                 f"CODEX_HOME={REMOTE_CODEX_HOME}",
                 *resume_command,
-                timeout=command_timeout,
             )
             devbox.detach()
             detached = True
@@ -450,6 +453,17 @@ def _configure_runtime_privilege_boundary(sandbox: Any) -> None:
         "!",
         "-r",
         REMOTE_CONTROL_DIR,
+    )
+    _run_expected_failure(
+        sandbox,
+        "sudo",
+        "-n",
+        "-u",
+        REMOTE_RUNTIME_USER,
+        "--",
+        "sudo",
+        "-n",
+        "true",
     )
 
 
@@ -709,6 +723,19 @@ def _run_root_checked(devbox: Any, *command: str) -> str:
     """Run one fixed setup argv with non-interactive root escalation."""
 
     return _run_checked(devbox, "sudo", "-n", "--", *command)
+
+
+def _run_expected_failure(devbox: Any, *command: str) -> None:
+    """Prove an unprivileged runtime command cannot gain root access."""
+
+    process = devbox.exec(*command, timeout=SETUP_COMMAND_TIMEOUT)
+    _read_all(process.stdout)
+    _read_all(process.stderr)
+    process.wait()
+    if _process_returncode(process) == 0:
+        raise HandoffError(
+            "Runloop runtime user can run sudo; refusing to give Codex access to Baton control state"
+        )
 
 
 def _stream_codex_events(

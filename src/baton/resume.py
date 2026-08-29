@@ -554,8 +554,15 @@ def _snapshot_member_bytes(archive_path: Path, member_path: PurePosixPath) -> by
 
 def _completion_marker(devbox: Any) -> Mapping[str, Any]:
     try:
-        raw_marker = devbox.filesystem.read_text(REMOTE_COMPLETION_MARKER)
-    except Exception as error:
+        raw_marker = _run_checked(
+            devbox,
+            "sudo",
+            "-n",
+            "cat",
+            "--",
+            REMOTE_COMPLETION_MARKER,
+        )
+    except ResumeError as error:
         raise ResumeError(
             "the remote handoff has not completed yet, or its Devbox is unavailable; "
             "wait for Codex to finish before restoring its session"
@@ -782,8 +789,9 @@ def _checkout_state_matches(left: _GitState, right: _GitState) -> bool:
 def _remote_git_state(devbox: Any) -> _GitState | None:
     def command(*arguments: str) -> tuple[str, ...]:
         return (
-            "runuser",
-            "--user",
+            "sudo",
+            "-n",
+            "-u",
             REMOTE_RUNTIME_USER,
             "--",
             "git",

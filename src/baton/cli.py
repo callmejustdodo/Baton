@@ -17,11 +17,11 @@ from .fetch import (
     write_handoff_receipt,
 )
 from .handoff import (
-    DEFAULT_MODAL_APP,
-    DEFAULT_MODAL_SECRET,
+    DEFAULT_RUNLOOP_BLUEPRINT,
+    DEFAULT_RUNLOOP_SECRET,
     HandoffError,
+    blueprint_name_for_version,
     handoff_archive,
-    image_name_for_version,
     infer_local_codex_version,
     prepare_runtime,
 )
@@ -33,7 +33,15 @@ from .picker import (
     list_local_sessions,
 )
 from .resume import ResumeError, resume_remote_session
+from .runloop import RunloopClientError, validate_account_secret_name
 from .snapshot import SnapshotError, snapshot
+
+
+def _runloop_secret_name(value: str) -> str:
+    try:
+        return validate_account_secret_name(value)
+    except RunloopClientError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,25 +76,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare_parser = subcommands.add_parser(
         "prepare",
-        help="build and publish the Modal Sandbox image with Codex and Git",
+        help="build a Runloop Blueprint with Codex and Git",
     )
     prepare_parser.add_argument(
         "--codex-version",
         help="Codex release to bake (default: local codex --version)",
     )
     prepare_parser.add_argument(
-        "--app-name",
-        default=DEFAULT_MODAL_APP,
-        help=f"Modal app to use (default: {DEFAULT_MODAL_APP})",
-    )
-    prepare_parser.add_argument(
-        "--image-name",
-        help="published Modal image name (default: baton-codex-<local version>)",
+        "--blueprint-name",
+        help="Runloop Blueprint name (default: baton-codex-<local version>)",
     )
 
     handoff_parser = subcommands.add_parser(
         "handoff",
-        help="snapshot a session and resume it in a Modal Sandbox",
+        help="snapshot a session and resume it in a Runloop Devbox",
     )
     handoff_parser.add_argument(
         "session_or_prompt",
@@ -118,42 +121,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="destination .tar.gz (default: <workspace>/.baton/snapshots/...)",
     )
     handoff_parser.add_argument(
-        "--app-name",
-        default=DEFAULT_MODAL_APP,
-        help=f"Modal app name for the Sandbox (default: {DEFAULT_MODAL_APP})",
-    )
-    handoff_parser.add_argument(
         "--secret-name",
-        default=DEFAULT_MODAL_SECRET,
+        default=DEFAULT_RUNLOOP_SECRET,
+        type=_runloop_secret_name,
         help=(
-            "Modal Secret containing OPENAI_API_KEY "
-            f"(default: {DEFAULT_MODAL_SECRET})"
+            "Runloop account secret injected as OPENAI_API_KEY "
+            f"(default: {DEFAULT_RUNLOOP_SECRET})"
         ),
     )
     handoff_parser.add_argument(
-        "--image-name",
-        help="published Modal image name (default: baton-codex-<local version>)",
+        "--blueprint-name",
+        help=(
+            "Runloop Blueprint name (default: baton-codex-<local Codex version>; "
+            f"or {DEFAULT_RUNLOOP_BLUEPRINT} when calling the Python API directly)"
+        ),
     )
     handoff_parser.add_argument(
         "--timeout",
         type=int,
         default=20 * 60,
-        help="Sandbox and Codex command timeout in seconds (default: 1200)",
+        help="Codex command timeout in seconds (default: 1200)",
+    )
+    handoff_parser.add_argument(
+        "--idle-suspend",
+        type=int,
+        default=5 * 60,
+        help="suspend the Devbox after this many idle seconds (default: 300)",
     )
     handoff_parser.add_argument(
         "--detach",
         action="store_true",
-        help="leave the remote Sandbox working after the local command exits",
+        help="leave the remote Devbox working after the local command exits",
     )
 
     fetch_parser = subcommands.add_parser(
         "fetch",
-        help="download and safely apply a completed Modal Sandbox workspace",
+        help="download and safely apply a completed Runloop Devbox workspace",
     )
     fetch_parser.add_argument(
-        "sandbox_id",
+        "devbox_id",
         nargs="?",
-        help="Modal Sandbox object ID to fetch (omit to open a handoff picker)",
+        help="Runloop Devbox ID to fetch (omit to open a handoff picker)",
     )
     fetch_parser.add_argument(
         "--workspace",
@@ -164,12 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_parser.add_argument(
         "--receipt",
         type=Path,
-        help="handoff receipt path (default: <workspace>/.baton/handoffs/<sandbox-id>.json)",
+        help="handoff receipt path (default: <workspace>/.baton/handoffs/<devbox-id>.json)",
     )
     fetch_parser.add_argument(
         "--output",
         type=Path,
-        help="fetch artifact directory (default: <workspace>/.baton/fetches/<sandbox-id>)",
+        help="fetch artifact directory (default: <workspace>/.baton/fetches/<devbox-id>)",
     )
     fetch_parser.add_argument(
         "--no-apply",
@@ -184,9 +192,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="restore a completed remote Codex session and open it locally",
     )
     resume_parser.add_argument(
-        "sandbox_id",
+        "devbox_id",
         nargs="?",
-        help="Modal Sandbox object ID to restore (omit to open a handoff picker)",
+        help="Runloop Devbox ID to restore (omit to open a handoff picker)",
     )
     resume_parser.add_argument(
         "--workspace",
@@ -197,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument(
         "--receipt",
         type=Path,
-        help="handoff receipt path (default: <workspace>/.baton/handoffs/<sandbox-id>.json)",
+        help="handoff receipt path (default: <workspace>/.baton/handoffs/<devbox-id>.json)",
     )
     resume_parser.add_argument(
         "--codex-home",
@@ -210,7 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "completed fetch artifact directory (default: "
-            "<workspace>/.baton/fetches/<sandbox-id>)"
+            "<workspace>/.baton/fetches/<devbox-id>)"
         ),
     )
     resume_parser.add_argument(
@@ -243,8 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             codex_version = args.codex_version or infer_local_codex_version()
             result = prepare_runtime(
                 codex_version=codex_version,
-                app_name=args.app_name,
-                image_name=args.image_name,
+                blueprint_name=args.blueprint_name,
             )
         except HandoffError as error:
             parser.error(str(error))
@@ -260,14 +267,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 codex_home=args.codex_home,
                 output=args.output,
             )
-            image_name = args.image_name or image_name_for_version(infer_local_codex_version())
+            blueprint_name = args.blueprint_name or blueprint_name_for_version(
+                infer_local_codex_version()
+            )
             result = handoff_archive(
                 archive_path=snapshot_result.path,
                 prompt=follow_up_prompt,
-                app_name=args.app_name,
-                modal_secret=args.secret_name,
-                image_name=image_name,
-                sandbox_timeout=args.timeout,
+                runloop_secret=args.secret_name,
+                blueprint_name=blueprint_name,
+                idle_suspend_seconds=args.idle_suspend,
                 command_timeout=args.timeout,
                 detach=args.detach,
                 on_event=_print_handoff_event,
@@ -275,7 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt_path = None
             if result.detached:
                 receipt_path = write_handoff_receipt(
-                    sandbox_id=result.sandbox_id,
+                    devbox_id=result.devbox_id,
                     session_id=result.session_id,
                     archive_path=snapshot_result.path,
                     workspace=args.workspace,
@@ -293,9 +301,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "fetch":
         try:
-            sandbox_id, receipt_path = _resolve_fetch_selection(args)
+            devbox_id, receipt_path = _resolve_fetch_selection(args)
             result = fetch_workspace(
-                sandbox_id=sandbox_id,
+                devbox_id=devbox_id,
                 workspace=args.workspace,
                 receipt_path=receipt_path,
                 output=args.output,
@@ -311,9 +319,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "resume":
         try:
-            sandbox_id, receipt_path = _resolve_fetch_selection(args)
+            devbox_id, receipt_path = _resolve_fetch_selection(args)
             result = resume_remote_session(
-                sandbox_id=sandbox_id,
+                devbox_id=devbox_id,
                 workspace=args.workspace,
                 codex_home=args.codex_home,
                 receipt_path=receipt_path,
@@ -353,14 +361,14 @@ def _resolve_handoff_selection(args: argparse.Namespace) -> tuple[str, str]:
 
 
 def _resolve_fetch_selection(args: argparse.Namespace) -> tuple[str, Path | None]:
-    """Use a receipt picker only when the Sandbox ID was omitted."""
+    """Use a receipt picker only when the Devbox ID was omitted."""
 
-    if args.sandbox_id is not None:
-        return args.sandbox_id, args.receipt
+    if args.devbox_id is not None:
+        return args.devbox_id, args.receipt
     if args.receipt is not None:
-        raise FetchError("--receipt requires an explicit Sandbox ID")
+        raise FetchError("--receipt requires an explicit Devbox ID")
     receipt = choose_handoff(list_handoff_receipts(workspace=args.workspace))
-    return receipt.sandbox_id, receipt.path
+    return receipt.devbox_id, receipt.path
 
 
 def _looks_like_uuid(value: str) -> bool:

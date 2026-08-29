@@ -109,6 +109,10 @@ class ResumeTests(unittest.TestCase):
         self.assertIsNotNone(backup_path)
         assert backup_path is not None
         self.assertEqual(backup_path.read_bytes(), BASELINE_ROLLOUT)
+        self.assertIn(
+            ("sudo", "-n", "cat", "--", REMOTE_COMPLETION_MARKER),
+            runloop.devbox.commands,
+        )
 
     def test_restore_uses_existing_devbox_without_credentials_or_lifecycle_changes(
         self,
@@ -606,8 +610,9 @@ class ResumeTests(unittest.TestCase):
 
     def test_remote_git_inspection_runs_as_the_runtime_workspace_owner(self) -> None:
         prefix = (
-            "runuser",
-            "--user",
+            "sudo",
+            "-n",
+            "-u",
             "baton-agent",
             "--",
             "git",
@@ -1185,6 +1190,10 @@ class _RemoteDevboxState:
             return _Process(stdout=f"{command[-1]}\n")
         if command[:4] == ("stat", "-c", "%s", "--"):
             return _Process(stdout=f"{len(self.filesystem.archive_bytes)}\n")
+        if command == ("sudo", "-n", "cat", "--", REMOTE_COMPLETION_MARKER):
+            if self.filesystem.marker is not None:
+                return _Process(stdout=self.filesystem.marker)
+            return _Process(stderr="marker not found", returncode=1)
         return _Process()
 
     def terminate(self) -> None:

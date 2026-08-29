@@ -383,7 +383,7 @@ def _render_handoff(receipt: HandoffReceipt) -> str:
     except OSError:
         modified = "unknown time"
     return (
-        f"{receipt.sandbox_id} — session {receipt.session_id} "
+        f"{receipt.devbox_id} — session {receipt.session_id} "
         f"(receipt updated {modified})"
     )
 

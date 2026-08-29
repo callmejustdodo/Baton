@@ -104,7 +104,7 @@ class HandoffTests(unittest.TestCase):
         result = handoff_archive(
             archive_path=self.archive,
             prompt="continue the task",
-            runloop_secret="baton-openai",
+            runloop_secret="BATON_OPENAI_API_KEY",
             blueprint_name="baton-codex-0-147-0",
             on_event=events.append,
             runloop_client=runloop,
@@ -119,10 +119,15 @@ class HandoffTests(unittest.TestCase):
                 {
                     "blueprint_name": "baton-codex-0-147-0",
                     "name": f"baton-{SESSION_ID[:8]}",
-                    "secrets": {"OPENAI_API_KEY": "baton-openai"},
+                    "secrets": {"OPENAI_API_KEY": "BATON_OPENAI_API_KEY"},
                     "launch_parameters": {
                         "architecture": "x86_64",
-                        "keep_alive_time_seconds": 1200,
+                        "lifecycle": {
+                            "after_idle": {
+                                "idle_time_seconds": 300,
+                                "on_idle": "suspend",
+                            }
+                        },
                     },
                     "metadata": {"baton": "handoff"},
                 }
@@ -351,9 +356,9 @@ class HandoffTests(unittest.TestCase):
         self.assertTrue(result.detached)
         self.assertIsNone(result.exit_code)
         self.assertFalse(runloop.devbox.terminated)
-        completion_command = next(
-            command
-            for command, _ in runloop.devbox.commands
+        completion_command, completion_metadata = next(
+            (command, metadata)
+            for command, metadata in runloop.devbox.commands
             if command[:4] == ("sudo", "-n", "sh", "-c")
             and "marker_temp=$2" in command[4]
         )
@@ -370,17 +375,64 @@ class HandoffTests(unittest.TestCase):
                 "-u",
                 REMOTE_RUNTIME_USER,
                 "--",
+                "timeout",
+                "--preserve-status",
+                "1200",
+            ),
+        )
+        self.assertEqual(
+            completion_command[18:21],
+            (
                 "env",
                 "HOME=/home/baton-agent",
                 f"CODEX_HOME={REMOTE_CODEX_HOME}",
             ),
         )
+        self.assertNotIn("timeout", completion_metadata)
         self.assertIn('"$@"', completion_command[4])
         self.assertNotIn(REMOTE_GIT_BASELINE, completion_command[4])
         self.assertNotIn(REMOTE_COMPLETION_MARKER, completion_command[4])
         self.assertNotIn(REMOTE_COMPLETION_TEMP, completion_command[4])
         self.assertLess(
             completion_command[4].index("/usr/bin/pkill"),
+            completion_command[4].index("printf"),
+        )
+
+    def test_detached_timeout_wraps_only_the_runtime_user_command(self) -> None:
+        runloop = _FakeRunloopClient()
+
+        handoff_archive(
+            archive_path=self.archive,
+            prompt="continue the task",
+            blueprint_name="baton-codex-0-147-0",
+            command_timeout=37,
+            detach=True,
+            runloop_client=runloop,
+        )
+
+        completion_command, completion_metadata = next(
+            (command, metadata)
+            for command, metadata in runloop.devbox.commands
+            if command[:4] == ("sudo", "-n", "sh", "-c")
+            and "marker_temp=$2" in command[4]
+        )
+        self.assertEqual(
+            completion_command[10:18],
+            (
+                "sudo",
+                "-n",
+                "-u",
+                REMOTE_RUNTIME_USER,
+                "--",
+                "timeout",
+                "--preserve-status",
+                "37",
+            ),
+        )
+        self.assertNotIn("timeout", completion_metadata)
+        self.assertIn('status=0; "$@" || status=$?', completion_command[4])
+        self.assertLess(
+            completion_command[4].index('"$@"'),
             completion_command[4].index("printf"),
         )
 
@@ -439,6 +491,19 @@ class HandoffTests(unittest.TestCase):
                 "!",
                 "-r",
                 REMOTE_CONTROL_DIR,
+            ),
+            commands,
+        )
+        self.assertIn(
+            (
+                "sudo",
+                "-n",
+                "-u",
+                REMOTE_RUNTIME_USER,
+                "--",
+                "sudo",
+                "-n",
+                "true",
             ),
             commands,
         )
@@ -730,10 +795,23 @@ class HandoffTests(unittest.TestCase):
             runloop.blueprint_calls[0]["name"],
             "baton-codex-0-147-0",
         )
-        commands = runloop.blueprint_calls[0]["launch_parameters"]["launch_commands"]
+        commands = runloop.blueprint_calls[0]["system_setup_commands"]
         self.assertTrue(any("git" in command for command in commands))
-        self.assertIn("sudo useradd --create-home --shell /bin/bash baton-agent || true", commands)
-        self.assertIn("sudo npm install --global @openai/codex@0.147.0", commands)
+        self.assertIn(
+            "id -u baton-agent >/dev/null 2>&1 || "
+            "sudo useradd --create-home --shell /bin/bash baton-agent",
+            commands,
+        )
+        self.assertIn("sudo gpasswd --delete baton-agent sudo || true", commands)
+        self.assertIn(
+            "printf '%s\\n' 'baton-agent ALL=(ALL:ALL) !ALL' | "
+            "sudo tee /etc/sudoers.d/99-baton-agent-deny >/dev/null",
+            commands,
+        )
+        self.assertIn("sudo visudo -cf /etc/sudoers.d/99-baton-agent-deny", commands)
+        self.assertTrue(any("CODEX_VERSION=0.147.0" in command for command in commands))
+        self.assertTrue(any("--prefix /usr/local" in command for command in commands))
+        self.assertTrue(any("install -m 755" in command for command in commands))
 
     def test_blueprint_name_tracks_the_codex_version(self) -> None:
         self.assertEqual(blueprint_name_for_version("0.147.0"), "baton-codex-0-147-0")
@@ -909,6 +987,17 @@ class _FakeExecutions:
                 stderr=[state.resume_stderr],
                 returncode=state.resume_returncode,
             )
+        elif parsed == (
+            "sudo",
+            "-n",
+            "-u",
+            REMOTE_RUNTIME_USER,
+            "--",
+            "sudo",
+            "-n",
+            "true",
+        ):
+            process = _FakeProcess(stderr=["sudo denied\n"], returncode=1)
         elif "find" in parsed:
             process = _FakeProcess(stdout=[state.find_stdout])
         elif parsed in state.git_stdout_by_command:

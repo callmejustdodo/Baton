@@ -8,12 +8,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from baton.cli import main
+from baton.cli import build_parser, main
 from baton.fetch import HandoffReceipt
 from baton.picker import PickerCancelled, SessionChoice
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
-SANDBOX_ID = "sb-picker-test"
+DEVBOX_ID = "devbox-picker-test"
 
 
 class CliPickerTests(unittest.TestCase):
@@ -27,18 +27,34 @@ class CliPickerTests(unittest.TestCase):
         self.snapshot_result = SimpleNamespace(path=self.root / "snapshot.tar.gz")
         self.handoff_result = SimpleNamespace(
             detached=False,
-            sandbox_id=SANDBOX_ID,
+            devbox_id=DEVBOX_ID,
             session_id=SESSION_ID,
-            to_dict=lambda: {"sandbox_id": SANDBOX_ID},
+            to_dict=lambda: {"devbox_id": DEVBOX_ID},
         )
-        self.fetch_result = SimpleNamespace(to_dict=lambda: {"sandbox_id": SANDBOX_ID})
+        self.fetch_result = SimpleNamespace(to_dict=lambda: {"devbox_id": DEVBOX_ID})
         self.resume_result = SimpleNamespace(
             local_exit_code=None,
-            to_dict=lambda: {"sandbox_id": SANDBOX_ID, "session_id": SESSION_ID},
+            to_dict=lambda: {"devbox_id": DEVBOX_ID, "session_id": SESSION_ID},
         )
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def test_handoff_defaults_to_valid_runloop_secret_name(self) -> None:
+        args = build_parser().parse_args(["handoff", "continue working"])
+
+        self.assertEqual(args.secret_name, "BATON_OPENAI_API_KEY")
+
+    def test_handoff_rejects_invalid_runloop_secret_name(self) -> None:
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            build_parser().parse_args(
+                ["handoff", "continue working", "--secret-name", "baton-openai"]
+            )
+
+        self.assertEqual(raised.exception.code, 2)
 
     def test_explicit_handoff_id_bypasses_session_picker(self) -> None:
         with (
@@ -67,6 +83,11 @@ class CliPickerTests(unittest.TestCase):
         self.assertEqual(
             handoff_mock.call_args.kwargs["prompt"], "continue exactly from here"
         )
+        self.assertEqual(
+            handoff_mock.call_args.kwargs["blueprint_name"], "baton-codex-0-147-0"
+        )
+        self.assertEqual(handoff_mock.call_args.kwargs["command_timeout"], 1200)
+        self.assertEqual(handoff_mock.call_args.kwargs["idle_suspend_seconds"], 300)
         sessions_mock.assert_not_called()
         picker_mock.assert_not_called()
 
@@ -122,10 +143,10 @@ class CliPickerTests(unittest.TestCase):
             patch("baton.cli.choose_handoff") as picker_mock,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            exit_code = main(["fetch", SANDBOX_ID, "--workspace", str(self.workspace)])
+            exit_code = main(["fetch", DEVBOX_ID, "--workspace", str(self.workspace)])
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(fetch_mock.call_args.kwargs["sandbox_id"], SANDBOX_ID)
+        self.assertEqual(fetch_mock.call_args.kwargs["devbox_id"], DEVBOX_ID)
         self.assertIsNone(fetch_mock.call_args.kwargs["receipt_path"])
         self.assertTrue(fetch_mock.call_args.kwargs["apply_changes"])
         receipts_mock.assert_not_called()
@@ -137,7 +158,7 @@ class CliPickerTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             exit_code = main(
-                ["fetch", SANDBOX_ID, "--workspace", str(self.workspace), "--no-apply"]
+                ["fetch", DEVBOX_ID, "--workspace", str(self.workspace), "--no-apply"]
             )
 
         self.assertEqual(exit_code, 0)
@@ -145,8 +166,8 @@ class CliPickerTests(unittest.TestCase):
 
     def test_fetch_without_id_selects_a_receipt_and_passes_its_exact_path(self) -> None:
         receipt = HandoffReceipt(
-            path=self.workspace / ".baton/handoffs" / f"{SANDBOX_ID}.json",
-            sandbox_id=SANDBOX_ID,
+            path=self.workspace / ".baton/handoffs" / f"{DEVBOX_ID}.json",
+            devbox_id=DEVBOX_ID,
             session_id=SESSION_ID,
             archive=self.root / "snapshot.tar.gz",
             workspace=self.workspace,
@@ -162,13 +183,13 @@ class CliPickerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         receipts_mock.assert_called_once_with(workspace=self.workspace)
         picker_mock.assert_called_once_with((receipt,))
-        self.assertEqual(fetch_mock.call_args.kwargs["sandbox_id"], SANDBOX_ID)
+        self.assertEqual(fetch_mock.call_args.kwargs["devbox_id"], DEVBOX_ID)
         self.assertEqual(fetch_mock.call_args.kwargs["receipt_path"], receipt.path)
 
-    def test_fetch_picker_cancellation_does_not_contact_modal(self) -> None:
+    def test_fetch_picker_cancellation_does_not_contact_runloop(self) -> None:
         receipt = HandoffReceipt(
-            path=self.workspace / ".baton/handoffs" / f"{SANDBOX_ID}.json",
-            sandbox_id=SANDBOX_ID,
+            path=self.workspace / ".baton/handoffs" / f"{DEVBOX_ID}.json",
+            devbox_id=DEVBOX_ID,
             session_id=SESSION_ID,
             archive=self.root / "snapshot.tar.gz",
             workspace=self.workspace,
@@ -197,7 +218,7 @@ class CliPickerTests(unittest.TestCase):
             exit_code = main(
                 [
                     "resume",
-                    SANDBOX_ID,
+                    DEVBOX_ID,
                     "--workspace",
                     str(self.workspace),
                     "--codex-home",
@@ -206,7 +227,7 @@ class CliPickerTests(unittest.TestCase):
             )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(resume_mock.call_args.kwargs["sandbox_id"], SANDBOX_ID)
+        self.assertEqual(resume_mock.call_args.kwargs["devbox_id"], DEVBOX_ID)
         self.assertEqual(resume_mock.call_args.kwargs["workspace"], self.workspace)
         self.assertEqual(resume_mock.call_args.kwargs["codex_home"], self.codex_home)
         self.assertIsNone(resume_mock.call_args.kwargs["receipt_path"])
@@ -216,8 +237,8 @@ class CliPickerTests(unittest.TestCase):
 
     def test_resume_picker_passes_receipt_and_no_launch(self) -> None:
         receipt = HandoffReceipt(
-            path=self.workspace / ".baton/handoffs" / f"{SANDBOX_ID}.json",
-            sandbox_id=SANDBOX_ID,
+            path=self.workspace / ".baton/handoffs" / f"{DEVBOX_ID}.json",
+            devbox_id=DEVBOX_ID,
             session_id=SESSION_ID,
             archive=self.root / "snapshot.tar.gz",
             workspace=self.workspace,
@@ -238,7 +259,7 @@ class CliPickerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         receipts_mock.assert_called_once_with(workspace=self.workspace)
         picker_mock.assert_called_once_with((receipt,))
-        self.assertEqual(resume_mock.call_args.kwargs["sandbox_id"], SANDBOX_ID)
+        self.assertEqual(resume_mock.call_args.kwargs["devbox_id"], DEVBOX_ID)
         self.assertEqual(resume_mock.call_args.kwargs["receipt_path"], receipt.path)
         self.assertFalse(resume_mock.call_args.kwargs["launch"])
 
@@ -252,6 +273,19 @@ class CliPickerTests(unittest.TestCase):
 
         self.assertEqual(error.exception.code, 2)
         picker_mock.assert_not_called()
+
+    def test_help_describes_only_the_runloop_flow(self) -> None:
+        with self.assertRaises(SystemExit) as error, contextlib.redirect_stdout(io.StringIO()) as output:
+            main(["handoff", "--help"])
+
+        self.assertEqual(error.exception.code, 0)
+        help_text = output.getvalue()
+        self.assertIn("Runloop", help_text)
+        self.assertIn("Devbox", help_text)
+        self.assertIn("--blueprint-name", help_text)
+        self.assertNotIn("Modal", help_text)
+        self.assertNotIn("--app-name", help_text)
+        self.assertNotIn("--image-name", help_text)
 
     @staticmethod
     def _session_choice() -> SessionChoice:

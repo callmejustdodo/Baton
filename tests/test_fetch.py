@@ -172,7 +172,10 @@ class FetchTests(unittest.TestCase):
         self.assertEqual((self.workspace / "new.txt").read_text(), "fresh\n")
         self.assertFalse((self.workspace / "keep.txt").exists())
         self.assertEqual(runloop.devboxes.retrieve_calls, [DEVBOX_ID])
-        self.assertEqual(runloop.devboxes.read_calls, [COMPLETION_PATH])
+        self.assertEqual(
+            runloop.devboxes.executions.commands[0],
+            ["sudo", "-n", "cat", "--", COMPLETION_PATH],
+        )
         self.assertEqual(runloop.devboxes.create_calls, [])
         self.assertEqual(runloop.devboxes.shutdown_calls, [])
 
@@ -509,15 +512,23 @@ class _ExecutionView:
 
 
 class _ExecutionResult:
-    exit_status = 0
-    stdout = ""
-    stderr = ""
+    def __init__(
+        self,
+        *,
+        exit_status: int = 0,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        self.exit_status = exit_status
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class _Executions:
     def __init__(self, parent: _Devboxes) -> None:
         self.parent = parent
         self.commands: list[list[str]] = []
+        self.results: dict[str, _ExecutionResult] = {}
 
     def execute_async(self, devbox_id: str, *, command: str) -> _ExecutionView:
         self.parent._require_id(devbox_id)
@@ -525,18 +536,29 @@ class _Executions:
         if argv[:3] == ["timeout", "--preserve-status", "120"]:
             argv = argv[3:]
         self.commands.append(argv)
+        result = _ExecutionResult()
         if argv[0] == "tar":
             remote_archive = argv[argv.index("-czf") + 1]
             self.parent.remote_files[remote_archive] = _tar_bytes(self.parent.members)
         elif argv[:2] == ["rm", "-f"]:
             self.parent.remote_files.pop(argv[2], None)
-        return _ExecutionView(f"execution-{len(self.commands)}")
+        elif argv[:4] == ["sudo", "-n", "cat", "--"]:
+            if argv[4] == COMPLETION_PATH and self.parent.marker is not None:
+                result = _ExecutionResult(stdout=self.parent.marker)
+            else:
+                result = _ExecutionResult(
+                    exit_status=1,
+                    stderr=f"cat: {argv[4]}: No such file or directory\n",
+                )
+        execution_id = f"execution-{len(self.commands)}"
+        self.results[execution_id] = result
+        return _ExecutionView(execution_id)
 
     def await_completed(self, execution_id: str, *, devbox_id: str) -> _ExecutionResult:
         self.parent._require_id(devbox_id)
         if not execution_id.startswith("execution-"):
             raise ValueError(execution_id)
-        return _ExecutionResult()
+        return self.results[execution_id]
 
 
 class _Devboxes:
@@ -545,7 +567,6 @@ class _Devboxes:
         self.marker = marker
         self.remote_files: dict[str, bytes] = {}
         self.retrieve_calls: list[str] = []
-        self.read_calls: list[str] = []
         self.download_calls: list[tuple[str, str]] = []
         self.create_calls: list[dict[str, object]] = []
         self.shutdown_calls: list[str] = []
@@ -554,13 +575,6 @@ class _Devboxes:
     def retrieve(self, devbox_id: str) -> _DevboxView:
         self.retrieve_calls.append(devbox_id)
         return _DevboxView(devbox_id)
-
-    def read_file_contents(self, devbox_id: str, *, file_path: str) -> str:
-        self._require_id(devbox_id)
-        self.read_calls.append(file_path)
-        if file_path == COMPLETION_PATH and self.marker is not None:
-            return self.marker
-        raise FileNotFoundError(file_path)
 
     def download_file(self, devbox_id: str, *, path: str) -> bytes:
         self._require_id(devbox_id)

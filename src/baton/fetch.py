@@ -373,7 +373,14 @@ def _load_handoff_receipt(path: Path, devbox_id: str) -> HandoffReceipt:
 
 def _require_completion_marker(devbox: Any) -> int:
     try:
-        raw_marker = devbox.filesystem.read_text(REMOTE_COMPLETION_MARKER)
+        raw_marker = _run_checked(
+            devbox,
+            "sudo",
+            "-n",
+            "cat",
+            "--",
+            REMOTE_COMPLETION_MARKER,
+        )
     except Exception as error:
         raise FetchError(
             "the remote handoff has not completed yet, or its Devbox is unavailable; "

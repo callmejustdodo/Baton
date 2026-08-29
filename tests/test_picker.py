@@ -169,7 +169,7 @@ class PickerTests(unittest.TestCase):
     def test_choose_handoff_returns_the_selected_receipt(self) -> None:
         receipt = HandoffReceipt(
             path=self.root / "handoff.json",
-            sandbox_id="sb-picker-test",
+            devbox_id="devbox-picker-test",
             session_id=SESSION_A,
             archive=self.root / "snapshot.tar.gz",
             workspace=self.root,
