@@ -532,11 +532,8 @@ def _capture_remote_git_state(sandbox: Any) -> dict[str, str]:
     not reproduce locally.
     """
 
-    repository_root = _run_checked(
+    repository_root = _run_runtime_git_checked(
         sandbox,
-        "git",
-        "-C",
-        REMOTE_WORKSPACE,
         "rev-parse",
         "--show-toplevel",
     ).strip()
@@ -546,27 +543,18 @@ def _capture_remote_git_state(sandbox: Any) -> dict[str, str]:
             f"{repository_root or 'no repository root'}"
         )
     return {
-        "head": _run_checked(
+        "head": _run_runtime_git_checked(
             sandbox,
-            "git",
-            "-C",
-            REMOTE_WORKSPACE,
             "rev-parse",
             "HEAD",
         ).strip(),
-        "branch": _run_checked(
+        "branch": _run_runtime_git_checked(
             sandbox,
-            "git",
-            "-C",
-            REMOTE_WORKSPACE,
             "branch",
             "--show-current",
         ).strip(),
-        "status": _run_checked(
+        "status": _run_runtime_git_checked(
             sandbox,
-            "git",
-            "-C",
-            REMOTE_WORKSPACE,
             "status",
             "--porcelain=v1",
             "-z",
@@ -575,35 +563,42 @@ def _capture_remote_git_state(sandbox: Any) -> dict[str, str]:
             ".",
             ":(exclude).baton",
         ),
-        "index": _run_checked(
+        "index": _run_runtime_git_checked(
             sandbox,
-            "git",
-            "-C",
-            REMOTE_WORKSPACE,
             "ls-files",
             "--stage",
             "-z",
             "--",
         ),
-        "index_flags": _run_checked(
+        "index_flags": _run_runtime_git_checked(
             sandbox,
-            "git",
-            "-C",
-            REMOTE_WORKSPACE,
             "ls-files",
             "-v",
             "-z",
             "--",
         ),
-        "refs": _run_checked(
+        "refs": _run_runtime_git_checked(
             sandbox,
-            "git",
-            "-C",
-            REMOTE_WORKSPACE,
             "for-each-ref",
             "--format=%(refname)%00%(objectname)%00%(symref)%00",
         ),
     }
+
+
+def _run_runtime_git_checked(sandbox: Any, *arguments: str) -> str:
+    """Run Git as the owner of the restored workspace after privilege setup."""
+
+    return _run_checked(
+        sandbox,
+        "runuser",
+        "--user",
+        REMOTE_RUNTIME_USER,
+        "--",
+        "git",
+        "-C",
+        REMOTE_WORKSPACE,
+        *arguments,
+    )
 
 
 def _write_detached_git_baseline(

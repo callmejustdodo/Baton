@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import UUID, uuid4
 
-from .handoff import HandoffError, REMOTE_COMPLETION_MARKER, inspect_snapshot_archive
+from .handoff import REMOTE_COMPLETION_MARKER, HandoffError, inspect_snapshot_archive
 from .snapshot import (
     EXCLUDED_PATH_COMPONENTS,
     KNOWN_SECRET_DIRECTORIES,

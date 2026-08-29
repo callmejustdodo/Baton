@@ -27,7 +27,13 @@ from .fetch import (
     _workspace_state_directory,
     _workspace_state_path,
 )
-from .handoff import HandoffError, SnapshotArchive, inspect_snapshot_archive
+from .handoff import (
+    REMOTE_RUNTIME_USER,
+    REMOTE_WORKSPACE,
+    HandoffError,
+    SnapshotArchive,
+    inspect_snapshot_archive,
+)
 
 REMOTE_CODEX_HOME = "/baton/.codex"
 SESSION_BACKUPS_DIRECTORY = Path(".baton") / "session-backups"
@@ -190,7 +196,11 @@ def resume_remote_session(
             baseline_git_state,
         )
         remote_rollout_path = _remote_path(rollout_relative)
-        _assert_remote_unlinked_regular_file(sandbox, remote_rollout_path)
+        _assert_remote_unlinked_regular_file(
+            sandbox,
+            remote_rollout_path,
+            canonical_root=REMOTE_CODEX_HOME,
+        )
         archive_members = [rollout_relative.as_posix()]
         total_payload_size = _assert_remote_file_size(
             sandbox,
@@ -202,6 +212,7 @@ def resume_remote_session(
             _assert_remote_unlinked_regular_file(
                 sandbox,
                 remote_index_path,
+                canonical_root=REMOTE_CODEX_HOME,
             )
             _assert_remote_file_size(
                 sandbox,
@@ -592,7 +603,14 @@ def _remote_regular_file_exists(sandbox: Any, remote_path: str) -> bool:
     return returncode == 0
 
 
-def _assert_remote_unlinked_regular_file(sandbox: Any, remote_path: str) -> None:
+def _assert_remote_unlinked_regular_file(
+    sandbox: Any,
+    remote_path: str,
+    *,
+    canonical_root: str | None = None,
+) -> None:
+    if canonical_root is not None:
+        _assert_remote_canonical_path(sandbox, remote_path, canonical_root)
     _run_checked(sandbox, "test", "-f", remote_path)
     try:
         _run_checked(sandbox, "test", "!", "-L", remote_path)
@@ -616,6 +634,51 @@ def _assert_remote_unlinked_regular_file(sandbox: Any, remote_path: str) -> None
         raise ResumeError(
             "remote session state has a hard-linked file; refusing to archive a file that "
             f"could alias credentials: {remote_path}"
+        )
+
+
+def _assert_remote_canonical_path(
+    sandbox: Any,
+    remote_path: str,
+    canonical_root: str,
+) -> None:
+    """Reject target or ancestor symlinks before reading remote session state."""
+
+    path = PurePosixPath(remote_path)
+    root = PurePosixPath(canonical_root)
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ResumeError(
+            f"remote session state is outside the expected Codex home: {remote_path}"
+        ) from error
+    if not relative.parts:
+        raise ResumeError("remote session state must name a file inside the Codex home")
+
+    try:
+        resolved_root = _run_checked(
+            sandbox,
+            "realpath",
+            "-e",
+            "--",
+            canonical_root,
+        ).strip()
+        resolved_path = _run_checked(
+            sandbox,
+            "realpath",
+            "-e",
+            "--",
+            remote_path,
+        ).strip()
+    except ResumeError as error:
+        raise ResumeError(
+            "remote session state does not have a canonical path inside the Codex home: "
+            f"{remote_path}"
+        ) from error
+    if resolved_root != canonical_root or resolved_path != remote_path:
+        raise ResumeError(
+            "remote session state resolves through a symlink or outside the Codex home; "
+            f"refusing to archive it: {remote_path}"
         )
 
 
@@ -714,13 +777,21 @@ def _checkout_state_matches(left: _GitState, right: _GitState) -> bool:
 
 
 def _remote_git_state(sandbox: Any) -> _GitState | None:
+    def command(*arguments: str) -> tuple[str, ...]:
+        return (
+            "runuser",
+            "--user",
+            REMOTE_RUNTIME_USER,
+            "--",
+            "git",
+            "-C",
+            REMOTE_WORKSPACE,
+            *arguments,
+        )
+
     returncode, stdout, _ = _run_remote_command(
         sandbox,
-        "git",
-        "-C",
-        "/baton/workspace",
-        "rev-parse",
-        "--is-inside-work-tree",
+        *command("rev-parse", "--is-inside-work-tree"),
     )
     if returncode != 0:
         return None
@@ -728,67 +799,45 @@ def _remote_git_state(sandbox: Any) -> _GitState | None:
         return None
     repository_root = _run_checked(
         sandbox,
-        "git",
-        "-C",
-        "/baton/workspace",
-        "rev-parse",
-        "--show-toplevel",
+        *command("rev-parse", "--show-toplevel"),
     ).strip()
-    if repository_root != "/baton/workspace":
+    if repository_root != REMOTE_WORKSPACE:
         raise ResumeError(
             "remote Git checkout is not rooted at /baton/workspace; refusing to restore a "
             "session against a nested or substituted repository"
         )
     return _GitState(
-        head=_run_checked(sandbox, "git", "-C", "/baton/workspace", "rev-parse", "HEAD").strip(),
+        head=_run_checked(sandbox, *command("rev-parse", "HEAD")).strip(),
         branch=_run_checked(
             sandbox,
-            "git",
-            "-C",
-            "/baton/workspace",
-            "branch",
-            "--show-current",
+            *command("branch", "--show-current"),
         ).strip(),
         status=_run_checked(
             sandbox,
-            "git",
-            "-C",
-            "/baton/workspace",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--",
-            ".",
-            ":(exclude).baton",
+            *command(
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                ".",
+                ":(exclude).baton",
+            ),
         ),
         index=_run_checked(
             sandbox,
-            "git",
-            "-C",
-            "/baton/workspace",
-            "ls-files",
-            "--stage",
-            "-z",
-            "--",
+            *command("ls-files", "--stage", "-z", "--"),
         ),
         index_flags=_run_checked(
             sandbox,
-            "git",
-            "-C",
-            "/baton/workspace",
-            "ls-files",
-            "-v",
-            "-z",
-            "--",
+            *command("ls-files", "-v", "-z", "--"),
         ),
         refs=_run_checked(
             sandbox,
-            "git",
-            "-C",
-            "/baton/workspace",
-            "for-each-ref",
-            "--format=%(refname)%00%(objectname)%00%(symref)%00",
+            *command(
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)%00%(symref)%00",
+            ),
         ),
     )
 

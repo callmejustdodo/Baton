@@ -430,6 +430,10 @@ class HandoffTests(unittest.TestCase):
         modal = _FakeModal(
             git_stdout_by_command={
                 (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
                     "git",
                     "-C",
                     REMOTE_WORKSPACE,
@@ -437,6 +441,10 @@ class HandoffTests(unittest.TestCase):
                     "--show-toplevel",
                 ): f"{REMOTE_WORKSPACE}\n",
                 (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
                     "git",
                     "-C",
                     REMOTE_WORKSPACE,
@@ -444,6 +452,10 @@ class HandoffTests(unittest.TestCase):
                     "HEAD",
                 ): f"{expected_git_state['head']}\n",
                 (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
                     "git",
                     "-C",
                     REMOTE_WORKSPACE,
@@ -451,6 +463,10 @@ class HandoffTests(unittest.TestCase):
                     "--show-current",
                 ): f"{expected_git_state['branch']}\n",
                 (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
                     "git",
                     "-C",
                     REMOTE_WORKSPACE,
@@ -463,6 +479,10 @@ class HandoffTests(unittest.TestCase):
                     ":(exclude).baton",
                 ): expected_git_state["status"],
                 (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
                     "git",
                     "-C",
                     REMOTE_WORKSPACE,
@@ -472,6 +492,10 @@ class HandoffTests(unittest.TestCase):
                     "--",
                 ): expected_git_state["index"],
                 (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
                     "git",
                     "-C",
                     REMOTE_WORKSPACE,
@@ -481,6 +505,10 @@ class HandoffTests(unittest.TestCase):
                     "--",
                 ): expected_git_state["index_flags"],
                 (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
                     "git",
                     "-C",
                     REMOTE_WORKSPACE,
@@ -510,8 +538,42 @@ class HandoffTests(unittest.TestCase):
         )
         commands = [command for command, _ in modal.sandbox.commands]
         completion_index = commands.index(completion_command)
+        ownership_boundary_index = commands.index(
+            (
+                "chown",
+                "-R",
+                f"{REMOTE_RUNTIME_USER}:{REMOTE_RUNTIME_USER}",
+                REMOTE_CODEX_HOME,
+                REMOTE_WORKSPACE,
+            )
+        )
+        self.assertLess(
+            commands.index(
+                (
+                    "git",
+                    "clone",
+                    "--no-checkout",
+                    "/baton/stage/git/repository.bundle",
+                    REMOTE_WORKSPACE,
+                )
+            ),
+            ownership_boundary_index,
+        )
         for git_command in modal.sandbox.git_stdout_by_command:
+            self.assertGreater(commands.index(git_command), ownership_boundary_index)
             self.assertLess(commands.index(git_command), completion_index)
+            self.assertEqual(
+                git_command[:7],
+                (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
+                    "git",
+                    "-C",
+                    REMOTE_WORKSPACE,
+                ),
+            )
         self.assertLess(
             commands.index(("chmod", "600", REMOTE_GIT_BASELINE)),
             completion_index,
@@ -543,7 +605,17 @@ class HandoffTests(unittest.TestCase):
         )
         self.assertFalse(
             any(
-                command[:4] == ("git", "-C", REMOTE_WORKSPACE, "rev-parse")
+                command[:8]
+                == (
+                    "runuser",
+                    "--user",
+                    REMOTE_RUNTIME_USER,
+                    "--",
+                    "git",
+                    "-C",
+                    REMOTE_WORKSPACE,
+                    "rev-parse",
+                )
                 for command, _ in modal.sandbox.commands
             )
         )
@@ -679,6 +751,8 @@ class _LocalGitSandbox:
 
     def exec(self, *command: str, **kwargs: object) -> _FakeProcess:
         translated = list(command)
+        if translated[:4] == ["runuser", "--user", REMOTE_RUNTIME_USER, "--"]:
+            translated = translated[4:]
         if translated[:3] == ["git", "-C", REMOTE_WORKSPACE]:
             translated[2] = str(self.repository)
         completed = subprocess.run(
@@ -689,6 +763,10 @@ class _LocalGitSandbox:
         )
         stdout = completed.stdout
         if command == (
+            "runuser",
+            "--user",
+            REMOTE_RUNTIME_USER,
+            "--",
             "git",
             "-C",
             REMOTE_WORKSPACE,

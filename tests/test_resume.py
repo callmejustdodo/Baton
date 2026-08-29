@@ -11,7 +11,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from baton.fetch import REMOTE_COMPLETION_MARKER
-from baton.resume import ResumeError, _GitState, resume_remote_session
+from baton.resume import (
+    ResumeError,
+    _GitState,
+    _remote_git_state,
+    resume_remote_session,
+)
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
 SANDBOX_ID = "sb-resume-test"
@@ -203,6 +208,69 @@ class ResumeTests(unittest.TestCase):
 
         self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
+
+    def test_remote_rollout_with_symlinked_ancestor_is_rejected_before_download(
+        self,
+    ) -> None:
+        remote_rollout_path = f"/baton/.codex/{ROLLOUT_PATH}"
+
+        def command_result(command: tuple[str, ...]) -> tuple[int, str, str] | None:
+            if command == ("realpath", "-e", "--", remote_rollout_path):
+                return 0, "/baton/.codex/auth.json\n", ""
+            return None
+
+        modal = _FakeModal(
+            {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
+            command_result=command_result,
+        )
+
+        with self.assertRaisesRegex(ResumeError, "symlink|outside the Codex home"):
+            resume_remote_session(
+                sandbox_id=SANDBOX_ID,
+                workspace=self.workspace,
+                codex_home=self.codex_home,
+                receipt_path=self.receipt,
+                modal_module=modal,
+            )
+
+        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
+        self.assertFalse(
+            any(command[:3] == ("stat", "-c", "%s") for command in modal.sandbox.commands)
+        )
+
+    def test_remote_index_with_symlinked_ancestor_is_rejected_before_filtering(
+        self,
+    ) -> None:
+        remote_index_path = "/baton/.codex/session_index.jsonl"
+
+        def command_result(command: tuple[str, ...]) -> tuple[int, str, str] | None:
+            if command == ("realpath", "-e", "--", remote_index_path):
+                return 0, "/baton/.codex/auth.json\n", ""
+            return None
+
+        modal = _FakeModal(
+            {
+                ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD,
+                "session_index.jsonl": b"{}\n",
+            },
+            command_result=command_result,
+        )
+
+        with self.assertRaisesRegex(ResumeError, "symlink|outside the Codex home"):
+            resume_remote_session(
+                sandbox_id=SANDBOX_ID,
+                workspace=self.workspace,
+                codex_home=self.codex_home,
+                receipt_path=self.receipt,
+                modal_module=modal,
+            )
+
+        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
+        self.assertFalse(
+            any(command[:2] == ("node", "-e") for command in modal.sandbox.commands)
+        )
 
     def test_duplicate_rollout_member_is_rejected_without_changing_local_rollout(
         self,
@@ -534,6 +602,60 @@ class ResumeTests(unittest.TestCase):
 
         self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
+
+    def test_remote_git_inspection_runs_as_the_runtime_workspace_owner(self) -> None:
+        prefix = (
+            "runuser",
+            "--user",
+            "baton-agent",
+            "--",
+            "git",
+            "-C",
+            "/baton/workspace",
+        )
+        outputs = {
+            ("rev-parse", "--is-inside-work-tree"): "true\n",
+            ("rev-parse", "--show-toplevel"): "/baton/workspace\n",
+            ("rev-parse", "HEAD"): "same-head\n",
+            ("branch", "--show-current"): "main\n",
+            (
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                ".",
+                ":(exclude).baton",
+            ): " M app.py\0",
+            ("ls-files", "--stage", "-z", "--"): "same-index",
+            ("ls-files", "-v", "-z", "--"): "same-index-flags",
+            (
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)%00%(symref)%00",
+            ): "same-refs",
+        }
+
+        def command_result(command: tuple[str, ...]) -> tuple[int, str, str] | None:
+            self.assertEqual(command[: len(prefix)], prefix)
+            arguments = command[len(prefix) :]
+            return 0, outputs[arguments], ""
+
+        modal = _FakeModal({}, command_result=command_result)
+
+        state = _remote_git_state(modal.sandbox)
+
+        self.assertEqual(
+            state,
+            _GitState(
+                head="same-head",
+                branch="main",
+                status=" M app.py\0",
+                index="same-index",
+                index_flags="same-index-flags",
+                refs="same-refs",
+            ),
+        )
+        self.assertEqual(len(modal.sandbox.commands), len(outputs))
 
     def test_matching_fetched_worktree_edit_can_restore_the_remote_rollout(self) -> None:
         _write_snapshot(
@@ -1058,6 +1180,8 @@ class _Sandbox:
                     stderr=stderr,
                     returncode=returncode,
                 )
+        if command[:3] == ("realpath", "-e", "--"):
+            return _Process(stdout=f"{command[-1]}\n")
         if command[:4] == ("stat", "-c", "%s", "--"):
             return _Process(stdout=f"{len(self.filesystem.archive_bytes)}\n")
         return _Process()
