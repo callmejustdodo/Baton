@@ -43,7 +43,9 @@ Build the reusable Sandbox image once. It bakes the matching Codex CLI release a
 baton prepare
 ```
 
-Run `baton prepare` again after changing the local Codex CLI version. Use `--app-name` or `--image-name` if you use names other than the defaults (`baton` and `baton-codex-<version>`); `--secret-name` is a `baton handoff` option.
+Run `baton prepare` again after changing the local Codex CLI version or updating Baton, so Modal publishes the current runtime image. Use `--app-name` or `--image-name` if you use names other than the defaults (`baton` and `baton-codex-<version>`); `--secret-name` is a `baton handoff` option.
+
+After a runtime-image update, start a new detached handoff: an already-running Sandbox keeps its older control layout.
 
 ## Quick start
 
@@ -91,7 +93,7 @@ baton resume
 
 Choose the same detached handoff. Baton downloads only that session's rollout and matching session-index record, verifies that the remote transcript extends the immutable handoff snapshot, backs up the local record under `.baton/session-backups/`, and starts `codex resume <session-id>` with your local `CODEX_HOME`. It never downloads the Sandbox's `auth.json`, global databases, plugins, logs, or other Codex runtime state. Run `baton resume --no-launch` when you only want to restore the conversation; then start it later with `codex resume <session-id>`.
 
-Fetch first: the restored conversation can refer to remote edits, while `baton resume` restores the conversation history only. Baton refuses to restore a remote session whose Codex command failed or whose local transcript advanced after handoff.
+Fetch first: the restored conversation can refer to remote edits, while `baton resume` restores the conversation history only. Baton refuses to restore a remote session whose Codex command failed, whose local transcript advanced after handoff, or whose remote Git checkout, index, or refs changed in a way fetch cannot reproduce locally.
 
 Add `.baton/` to the target project's `.gitignore`: snapshots contain source and transcripts and should stay local.
 
@@ -164,7 +166,7 @@ Or pass the Sandbox ID explicitly:
 baton resume <sandbox-id>
 ```
 
-Like `fetch`, the explicit form needs the matching receipt (or `--receipt PATH`), and the picker is available only in an interactive terminal. `baton resume` requires a successful completed remote handoff plus its successfully applied fetch artifact, and will refuse to overwrite a locally advanced version of that session. It restores only the selected rollout plus the selected session-index record; it does not copy remote API-key auth or global Codex databases. Use `--no-launch` to restore without opening the local TUI, `--codex-home PATH` to restore into a non-default local Codex home, or `--fetch-root PATH` if you gave `baton fetch` a custom output directory.
+Like `fetch`, the explicit form needs the matching receipt (or `--receipt PATH`), and the picker is available only in an interactive terminal. `baton resume` requires a successful completed remote handoff plus its successfully applied fetch artifact, and will refuse to overwrite a locally advanced version of that session or reopen it when remote Git commits, refs, or index changes were not reproduced by fetch. It restores only the selected rollout plus the selected session-index record; it does not copy remote API-key auth or global Codex databases. Use `--no-launch` to restore without opening the local TUI, `--codex-home PATH` to restore into a non-default local Codex home, or `--fetch-root PATH` if you gave `baton fetch` a custom output directory.
 
 ## What Baton moves—and what it does not
 
@@ -184,7 +186,7 @@ The snapshot contains the selected Codex rollout, its matching session-index rec
 | Missing `OPENAI_API_KEY` Secret | Run `modal secret create baton-openai OPENAI_API_KEY="$OPENAI_API_KEY"`, then retry with the same Modal profile. |
 | Native dependency/build-output error | Remove generated/native outputs from the handoff scope; Baton will fail rather than rebuild across macOS arm64 and Linux x86_64. |
 | Fetch says the remote handoff has not completed | Wait for Codex to finish, then run `baton fetch` again. |
-| `baton resume` refuses the remote handoff | Fetch the workspace artifact for review. Baton restores sessions only after a successful remote Codex exit and never overwrites a locally advanced transcript. |
+| `baton resume` refuses the remote handoff | Fetch the workspace artifact for review. Baton restores sessions only after a successful remote Codex exit, a matching workspace/Git state, and no locally advanced transcript. |
 
 ## Development
 

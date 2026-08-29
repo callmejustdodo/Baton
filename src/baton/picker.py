@@ -119,7 +119,7 @@ def choose_handoff(
 
     return _choose(
         receipts,
-        title="Select a detached Baton handoff to fetch:",
+        title="Select a detached Baton handoff:",
         render=_render_handoff,
         ordering_hint="Most recently created handoff is first.",
         empty_message=(

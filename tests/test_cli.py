@@ -32,6 +32,10 @@ class CliPickerTests(unittest.TestCase):
             to_dict=lambda: {"sandbox_id": SANDBOX_ID},
         )
         self.fetch_result = SimpleNamespace(to_dict=lambda: {"sandbox_id": SANDBOX_ID})
+        self.resume_result = SimpleNamespace(
+            local_exit_code=None,
+            to_dict=lambda: {"sandbox_id": SANDBOX_ID, "session_id": SESSION_ID},
+        )
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -179,6 +183,64 @@ class CliPickerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 130)
         fetch_mock.assert_not_called()
+
+    def test_explicit_resume_id_restores_and_opens_local_codex(self) -> None:
+        with (
+            patch(
+                "baton.cli.resume_remote_session",
+                return_value=self.resume_result,
+            ) as resume_mock,
+            patch("baton.cli.list_handoff_receipts") as receipts_mock,
+            patch("baton.cli.choose_handoff") as picker_mock,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main(
+                [
+                    "resume",
+                    SANDBOX_ID,
+                    "--workspace",
+                    str(self.workspace),
+                    "--codex-home",
+                    str(self.codex_home),
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(resume_mock.call_args.kwargs["sandbox_id"], SANDBOX_ID)
+        self.assertEqual(resume_mock.call_args.kwargs["workspace"], self.workspace)
+        self.assertEqual(resume_mock.call_args.kwargs["codex_home"], self.codex_home)
+        self.assertIsNone(resume_mock.call_args.kwargs["receipt_path"])
+        self.assertTrue(resume_mock.call_args.kwargs["launch"])
+        receipts_mock.assert_not_called()
+        picker_mock.assert_not_called()
+
+    def test_resume_picker_passes_receipt_and_no_launch(self) -> None:
+        receipt = HandoffReceipt(
+            path=self.workspace / ".baton/handoffs" / f"{SANDBOX_ID}.json",
+            sandbox_id=SANDBOX_ID,
+            session_id=SESSION_ID,
+            archive=self.root / "snapshot.tar.gz",
+            workspace=self.workspace,
+        )
+        with (
+            patch("baton.cli.list_handoff_receipts", return_value=(receipt,)) as receipts_mock,
+            patch("baton.cli.choose_handoff", return_value=receipt) as picker_mock,
+            patch(
+                "baton.cli.resume_remote_session",
+                return_value=self.resume_result,
+            ) as resume_mock,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main(
+                ["resume", "--workspace", str(self.workspace), "--no-launch"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        receipts_mock.assert_called_once_with(workspace=self.workspace)
+        picker_mock.assert_called_once_with((receipt,))
+        self.assertEqual(resume_mock.call_args.kwargs["sandbox_id"], SANDBOX_ID)
+        self.assertEqual(resume_mock.call_args.kwargs["receipt_path"], receipt.path)
+        self.assertFalse(resume_mock.call_args.kwargs["launch"])
 
     def test_session_id_without_a_prompt_is_not_mistaken_for_picker_mode(self) -> None:
         with (

@@ -32,6 +32,7 @@ from .picker import (
     choose_session,
     list_local_sessions,
 )
+from .resume import ResumeError, resume_remote_session
 from .snapshot import SnapshotError, snapshot
 
 
@@ -177,6 +178,46 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="download the fetched result for review without changing the workspace",
     )
+
+    resume_parser = subcommands.add_parser(
+        "resume",
+        help="restore a completed remote Codex session and open it locally",
+    )
+    resume_parser.add_argument(
+        "sandbox_id",
+        nargs="?",
+        help="Modal Sandbox object ID to restore (omit to open a handoff picker)",
+    )
+    resume_parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path.cwd(),
+        help="workspace containing the detached-handoff receipt (default: current directory)",
+    )
+    resume_parser.add_argument(
+        "--receipt",
+        type=Path,
+        help="handoff receipt path (default: <workspace>/.baton/handoffs/<sandbox-id>.json)",
+    )
+    resume_parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")),
+        help="local CODEX_HOME to restore into (default: $CODEX_HOME or ~/.codex)",
+    )
+    resume_parser.add_argument(
+        "--fetch-root",
+        type=Path,
+        help=(
+            "completed fetch artifact directory (default: "
+            "<workspace>/.baton/fetches/<sandbox-id>)"
+        ),
+    )
+    resume_parser.add_argument(
+        "--no-launch",
+        action="store_true",
+        help="restore the session without opening the local Codex TUI",
+    )
     return parser
 
 
@@ -267,6 +308,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(str(error))
         print(json.dumps({"type": "fetch_complete", **result.to_dict()}, sort_keys=True))
         return 0
+
+    if args.command == "resume":
+        try:
+            sandbox_id, receipt_path = _resolve_fetch_selection(args)
+            result = resume_remote_session(
+                sandbox_id=sandbox_id,
+                workspace=args.workspace,
+                codex_home=args.codex_home,
+                receipt_path=receipt_path,
+                fetch_root=args.fetch_root,
+                launch=not args.no_launch,
+            )
+        except PickerCancelled:
+            print("Baton: selection cancelled", file=sys.stderr)
+            return 130
+        except (FetchError, ResumeError, PickerError) as error:
+            parser.error(str(error))
+        print(json.dumps({"type": "session_restored", **result.to_dict()}, sort_keys=True))
+        return result.local_exit_code or 0
 
     parser.error(f"unsupported command: {args.command}")
     return 2
