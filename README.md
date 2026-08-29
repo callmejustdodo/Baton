@@ -1,6 +1,6 @@
 # Baton
 
-Move an in-progress Codex session from your laptop to a [Modal Sandbox](https://modal.com/docs/guide/sandboxes), then safely bring the completed remote work back after the agent finishes.
+You can close your MacBook now: Baton moves an in-progress Codex session to a [Modal Sandbox](https://modal.com/docs/guide/sandboxes), then safely brings the completed remote work back.
 
 Baton snapshots the selected Codex rollout, your workspace, and Git state; restores them under `/baton` in a Linux x86_64 Sandbox; and resumes Codex non-interactively. It is intentionally a handoff tool, not a live terminal connection or a PR bot.
 
