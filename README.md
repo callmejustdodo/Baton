@@ -19,6 +19,26 @@ Baton is a checkpoint-and-handoff tool, not a live terminal connection or a PR b
 3. **Fetch** — download the completed workspace and safely apply its changes when the local baseline still matches.
 4. **Resume** — restore the completed remote conversation into the local Codex TUI.
 
+## Your first handoff
+
+After the one-time setup below, this is the whole loop. Run it from the project
+whose Codex session you want to continue:
+
+```bash
+baton handoff "Continue the task and write a concise summary to HANDOFF_RESULT.md." --detach
+```
+
+Choose the session with ↑/↓ and Enter, then close your MacBook. When you return
+to the same project, collect the work and conversation:
+
+```bash
+baton fetch   # safely auto-applies changes when the local baseline still matches
+baton resume  # restores the completed Codex conversation locally
+```
+
+Use `baton fetch --no-apply` when you want to review the downloaded patch before
+changing local files.
+
 ## Quick start
 
 ### 1. Configure Runloop
