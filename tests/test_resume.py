@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import shutil
 import tarfile
 import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from baton.fetch import REMOTE_COMPLETION_MARKER
@@ -19,7 +21,7 @@ from baton.resume import (
 )
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
-SANDBOX_ID = "sb-resume-test"
+DEVBOX_ID = "devbox-resume-test"
 ROLLOUT_PATH = f"sessions/2026/08/23/rollout-2026-08-23T13-14-26-{SESSION_ID}.jsonl"
 BASELINE_ROLLOUT = (
     json.dumps({"payload": {"session_id": SESSION_ID}}).encode("utf-8") + b"\n"
@@ -51,13 +53,13 @@ class ResumeTests(unittest.TestCase):
         )
         self.snapshot = self.root / "snapshot.tar.gz"
         _write_snapshot(self.snapshot)
-        self.receipt = self.workspace / ".baton/handoffs" / f"{SANDBOX_ID}.json"
+        self.receipt = self.workspace / ".baton/handoffs" / f"{DEVBOX_ID}.json"
         self.receipt.parent.mkdir(parents=True)
         self.receipt.write_text(
             json.dumps(
                 {
-                    "format_version": 1,
-                    "sandbox_id": SANDBOX_ID,
+                    "format_version": 2,
+                    "devbox_id": DEVBOX_ID,
                     "session_id": SESSION_ID,
                     "archive": str(self.snapshot.resolve()),
                     "workspace": str(self.workspace.resolve()),
@@ -65,14 +67,14 @@ class ResumeTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        self.fetch_root = self.workspace / ".baton/fetches" / SANDBOX_ID
+        self.fetch_root = self.workspace / ".baton/fetches" / DEVBOX_ID
         fetched_workspace = self.fetch_root / "workspace"
         fetched_workspace.mkdir(parents=True)
         (fetched_workspace / "app.py").write_text("print('local')\n", encoding="utf-8")
         (self.fetch_root / "result.json").write_text(
             json.dumps(
                 {
-                    "sandbox_id": SANDBOX_ID,
+                    "devbox_id": DEVBOX_ID,
                     "session_id": SESSION_ID,
                     "archive": str(self.snapshot.resolve()),
                     "remote_workspace": str(fetched_workspace.resolve()),
@@ -90,14 +92,14 @@ class ResumeTests(unittest.TestCase):
         self,
     ) -> None:
         remote_rollout = BASELINE_ROLLOUT + REMOTE_RECORD
-        modal = _FakeModal({ROLLOUT_PATH: remote_rollout})
+        runloop = _FakeRunloop({ROLLOUT_PATH: remote_rollout})
 
         result = resume_remote_session(
-            sandbox_id=SANDBOX_ID,
+            devbox_id=DEVBOX_ID,
             workspace=self.workspace,
             codex_home=self.codex_home,
             receipt_path=self.receipt,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
         self.assertEqual(self.local_rollout.read_bytes(), remote_rollout)
@@ -108,32 +110,31 @@ class ResumeTests(unittest.TestCase):
         assert backup_path is not None
         self.assertEqual(backup_path.read_bytes(), BASELINE_ROLLOUT)
 
-    def test_restore_uses_existing_sandbox_without_modal_credentials_or_lifecycle_changes(
+    def test_restore_uses_existing_devbox_without_credentials_or_lifecycle_changes(
         self,
     ) -> None:
-        modal = _FakeModal({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
+        runloop = _FakeRunloop({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
 
         resume_remote_session(
-            sandbox_id=SANDBOX_ID,
+            devbox_id=DEVBOX_ID,
             workspace=self.workspace,
             codex_home=self.codex_home,
             receipt_path=self.receipt,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
-        self.assertEqual(modal.Sandbox.from_id_calls, [SANDBOX_ID])
-        self.assertEqual(modal.Sandbox.create_calls, [])
-        self.assertEqual(modal.app_lookup_calls, [])
-        self.assertEqual(modal.secret_calls, [])
-        self.assertFalse(modal.sandbox.terminated)
-        self.assertFalse(modal.sandbox.detached)
+        self.assertEqual(runloop.devboxes.retrieve_calls, [DEVBOX_ID])
+        self.assertEqual(runloop.devboxes.create_calls, [])
+        self.assertEqual(runloop.devboxes.shutdown_calls, [])
+        self.assertFalse(runloop.devbox.terminated)
+        self.assertFalse(runloop.devbox.detached)
         self.assertNotIn(
             "auth.json",
-            " ".join(part for command in modal.sandbox.commands for part in command),
+            " ".join(part for command in runloop.devbox.commands for part in command),
         )
 
     def test_remote_auth_member_is_rejected_without_changing_local_auth(self) -> None:
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {
                 ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD,
                 "auth.json": b"remote-auth\n",
@@ -142,17 +143,17 @@ class ResumeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ResumeError, "auth|unexpected|credential|member"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual((self.codex_home / "auth.json").read_text(), "local-auth\n")
 
     def test_traversal_member_is_rejected_without_changing_local_rollout(self) -> None:
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {
                 ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD,
                 "../outside.jsonl": b"escape\n",
@@ -161,11 +162,11 @@ class ResumeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ResumeError, "unsafe|member|path"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
@@ -173,15 +174,15 @@ class ResumeTests(unittest.TestCase):
     def test_symlinked_rollout_member_is_rejected_without_changing_local_rollout(
         self,
     ) -> None:
-        modal = _FakeModal({}, archive_bytes=_tar_symlink(ROLLOUT_PATH, "auth.json"))
+        runloop = _FakeRunloop({}, archive_bytes=_tar_symlink(ROLLOUT_PATH, "auth.json"))
 
         with self.assertRaisesRegex(ResumeError, "regular file|member|link"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
@@ -192,21 +193,21 @@ class ResumeTests(unittest.TestCase):
                 return 1, "", ""
             return None
 
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             command_result=command_result,
         )
 
         with self.assertRaisesRegex(ResumeError, "symlink|credentials"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
 
     def test_remote_rollout_with_symlinked_ancestor_is_rejected_before_download(
@@ -219,24 +220,24 @@ class ResumeTests(unittest.TestCase):
                 return 0, "/baton/.codex/auth.json\n", ""
             return None
 
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             command_result=command_result,
         )
 
         with self.assertRaisesRegex(ResumeError, "symlink|outside the Codex home"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
         self.assertFalse(
-            any(command[:3] == ("stat", "-c", "%s") for command in modal.sandbox.commands)
+            any(command[:3] == ("stat", "-c", "%s") for command in runloop.devbox.commands)
         )
 
     def test_remote_index_with_symlinked_ancestor_is_rejected_before_filtering(
@@ -249,7 +250,7 @@ class ResumeTests(unittest.TestCase):
                 return 0, "/baton/.codex/auth.json\n", ""
             return None
 
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {
                 ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD,
                 "session_index.jsonl": b"{}\n",
@@ -259,23 +260,23 @@ class ResumeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ResumeError, "symlink|outside the Codex home"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
         self.assertFalse(
-            any(command[:2] == ("node", "-e") for command in modal.sandbox.commands)
+            any(command[:2] == ("node", "-e") for command in runloop.devbox.commands)
         )
 
     def test_duplicate_rollout_member_is_rejected_without_changing_local_rollout(
         self,
     ) -> None:
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {},
             archive_bytes=_tar_duplicate(
                 ROLLOUT_PATH,
@@ -285,11 +286,11 @@ class ResumeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ResumeError, "duplicate member"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
@@ -297,15 +298,15 @@ class ResumeTests(unittest.TestCase):
     def test_hardlinked_rollout_member_is_rejected_without_changing_local_rollout(
         self,
     ) -> None:
-        modal = _FakeModal({}, archive_bytes=_tar_hardlink(ROLLOUT_PATH, "auth.json"))
+        runloop = _FakeRunloop({}, archive_bytes=_tar_hardlink(ROLLOUT_PATH, "auth.json"))
 
         with self.assertRaisesRegex(ResumeError, "regular file"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
@@ -313,15 +314,15 @@ class ResumeTests(unittest.TestCase):
     def test_device_rollout_member_is_rejected_without_changing_local_rollout(
         self,
     ) -> None:
-        modal = _FakeModal({}, archive_bytes=_tar_device(ROLLOUT_PATH))
+        runloop = _FakeRunloop({}, archive_bytes=_tar_device(ROLLOUT_PATH))
 
         with self.assertRaisesRegex(ResumeError, "regular file"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
@@ -329,7 +330,7 @@ class ResumeTests(unittest.TestCase):
     def test_archive_with_too_many_members_is_rejected_without_changing_local_rollout(
         self,
     ) -> None:
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {
                 ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD,
                 "session_index.jsonl": b"",
@@ -339,11 +340,11 @@ class ResumeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ResumeError, "too many members"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
@@ -352,68 +353,68 @@ class ResumeTests(unittest.TestCase):
         self,
     ) -> None:
         truncated_rollout = BASELINE_ROLLOUT + b'{"type":"response_item"}'
-        modal = _FakeModal({ROLLOUT_PATH: truncated_rollout})
+        runloop = _FakeRunloop({ROLLOUT_PATH: truncated_rollout})
 
         with self.assertRaisesRegex(ResumeError, "truncated final JSONL record"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
 
-    def test_receipt_for_another_session_is_rejected_before_modal_lookup(self) -> None:
+    def test_receipt_for_another_session_is_rejected_before_runloop_lookup(self) -> None:
         payload = json.loads(self.receipt.read_text(encoding="utf-8"))
         payload["session_id"] = "11111111-1111-4111-8111-111111111111"
         self.receipt.write_text(json.dumps(payload), encoding="utf-8")
-        modal = _FakeModal({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
+        runloop = _FakeRunloop({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
 
         with self.assertRaisesRegex(ResumeError, "receipt|session|snapshot"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.Sandbox.from_id_calls, [])
+        self.assertEqual(runloop.devboxes.retrieve_calls, [])
 
     def test_incomplete_handoff_is_rejected_before_session_download(self) -> None:
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD}, marker=None
         )
 
         with self.assertRaisesRegex(ResumeError, "still working|completion|complete"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
 
     def test_failed_remote_handoff_is_rejected_before_session_download(self) -> None:
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             marker='{"exit_code": 2}\n',
         )
 
         with self.assertRaisesRegex(ResumeError, "exit|failed|successful|status"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
 
     def test_remote_git_head_mismatch_is_rejected_before_session_download(self) -> None:
         _write_snapshot(
@@ -425,7 +426,7 @@ class ResumeTests(unittest.TestCase):
                 "bundle_archive_path": "git/repository.bundle",
             },
         )
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             marker=json.dumps(
                 {
@@ -468,14 +469,14 @@ class ResumeTests(unittest.TestCase):
             self.assertRaisesRegex(ResumeError, "Git state differs|different repository"),
         ):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
 
     def test_remote_git_index_mismatch_is_rejected_before_session_download(self) -> None:
@@ -488,7 +489,7 @@ class ResumeTests(unittest.TestCase):
                 "bundle_archive_path": "git/repository.bundle",
             },
         )
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             marker=json.dumps(
                 {
@@ -531,14 +532,14 @@ class ResumeTests(unittest.TestCase):
             self.assertRaisesRegex(ResumeError, "Git state differs|different repository"),
         ):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
 
     def test_remote_git_refs_changed_from_marker_are_rejected_before_download(
@@ -566,7 +567,7 @@ class ResumeTests(unittest.TestCase):
                 },
             }
         )
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             marker=marker,
         )
@@ -593,14 +594,14 @@ class ResumeTests(unittest.TestCase):
             self.assertRaisesRegex(ResumeError, "Git state changed after handoff"),
         ):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
 
     def test_remote_git_inspection_runs_as_the_runtime_workspace_owner(self) -> None:
@@ -640,9 +641,9 @@ class ResumeTests(unittest.TestCase):
             arguments = command[len(prefix) :]
             return 0, outputs[arguments], ""
 
-        modal = _FakeModal({}, command_result=command_result)
+        runloop = _FakeRunloop({}, command_result=command_result)
 
-        state = _remote_git_state(modal.sandbox)
+        state = _remote_git_state(runloop.devbox)
 
         self.assertEqual(
             state,
@@ -655,7 +656,7 @@ class ResumeTests(unittest.TestCase):
                 refs="same-refs",
             ),
         )
-        self.assertEqual(len(modal.sandbox.commands), len(outputs))
+        self.assertEqual(len(runloop.devbox.commands), len(outputs))
 
     def test_matching_fetched_worktree_edit_can_restore_the_remote_rollout(self) -> None:
         _write_snapshot(
@@ -680,7 +681,7 @@ class ResumeTests(unittest.TestCase):
                 },
             }
         )
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             marker=marker,
         )
@@ -698,11 +699,11 @@ class ResumeTests(unittest.TestCase):
             patch("baton.resume._local_git_state", return_value=post_fetch_state),
         ):
             result = resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(result.session_id, SESSION_ID)
@@ -718,7 +719,7 @@ class ResumeTests(unittest.TestCase):
                 "bundle_archive_path": "git/repository.bundle",
             },
         )
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             marker=json.dumps({"exit_code": 0}),
         )
@@ -737,14 +738,14 @@ class ResumeTests(unittest.TestCase):
             self.assertRaisesRegex(ResumeError, "Git baseline|git_state"),
         ):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
 
     def test_git_snapshot_with_null_marker_baseline_is_rejected_before_download(self) -> None:
         _write_snapshot(
@@ -756,7 +757,7 @@ class ResumeTests(unittest.TestCase):
                 "bundle_archive_path": "git/repository.bundle",
             },
         )
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             marker=json.dumps({"exit_code": 0, "git_state": None}),
         )
@@ -775,14 +776,14 @@ class ResumeTests(unittest.TestCase):
             self.assertRaisesRegex(ResumeError, "Git baseline|git_state"),
         ):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
 
     def test_oversized_remote_archive_is_rejected_before_download(self) -> None:
         def command_result(command: tuple[str, ...]) -> tuple[int, str, str] | None:
@@ -795,7 +796,7 @@ class ResumeTests(unittest.TestCase):
                 return (0, "1025\n", "")
             return (0, "1\n", "")
 
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD},
             command_result=command_result,
         )
@@ -807,71 +808,71 @@ class ResumeTests(unittest.TestCase):
             self.assertRaisesRegex(ResumeError, "archive.*safety limit|archive.*too large"),
         ):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertTrue(
             any(
                 command[:3] == ("stat", "-c", "%s")
                 and command[-1].startswith("/tmp/baton-session-")
-                for command in modal.sandbox.commands
+                for command in runloop.devbox.commands
             )
         )
-        self.assertEqual(modal.sandbox.filesystem.copy_calls, [])
+        self.assertEqual(runloop.devbox.filesystem.copy_calls, [])
 
-    def test_missing_applied_fetch_artifact_is_rejected_before_modal_lookup(
+    def test_missing_applied_fetch_artifact_is_rejected_before_runloop_lookup(
         self,
     ) -> None:
         shutil.rmtree(self.fetch_root)
-        modal = _FakeModal({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
+        runloop = _FakeRunloop({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
 
         with self.assertRaisesRegex(ResumeError, "fetch|workspace|applied"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.Sandbox.from_id_calls, [])
+        self.assertEqual(runloop.devboxes.retrieve_calls, [])
 
-    def test_non_applied_fetch_artifact_is_rejected_before_modal_lookup(self) -> None:
+    def test_non_applied_fetch_artifact_is_rejected_before_runloop_lookup(self) -> None:
         result_path = self.fetch_root / "result.json"
         result = json.loads(result_path.read_text(encoding="utf-8"))
         result.update({"applied": False, "apply_status": "review_only"})
         result_path.write_text(json.dumps(result), encoding="utf-8")
-        modal = _FakeModal({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
+        runloop = _FakeRunloop({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
 
         with self.assertRaisesRegex(ResumeError, "fetch|workspace|applied"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.Sandbox.from_id_calls, [])
+        self.assertEqual(runloop.devboxes.retrieve_calls, [])
 
-    def test_workspace_drift_after_fetch_is_rejected_before_modal_lookup(self) -> None:
+    def test_workspace_drift_after_fetch_is_rejected_before_runloop_lookup(self) -> None:
         (self.workspace / "app.py").write_text("print('drift')\n", encoding="utf-8")
-        modal = _FakeModal({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
+        runloop = _FakeRunloop({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
 
         with self.assertRaisesRegex(ResumeError, "fetch|workspace|changed|drift|match"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
-        self.assertEqual(modal.Sandbox.from_id_calls, [])
+        self.assertEqual(runloop.devboxes.retrieve_calls, [])
 
     def test_remote_rollout_that_does_not_extend_snapshot_is_rejected_without_mutation(
         self,
@@ -882,15 +883,15 @@ class ResumeTests(unittest.TestCase):
             ).encode()
             + b"\n"
         )
-        modal = _FakeModal({ROLLOUT_PATH: divergent})
+        runloop = _FakeRunloop({ROLLOUT_PATH: divergent})
 
         with self.assertRaisesRegex(ResumeError, "extend|baseline|prefix|diverge"):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
@@ -902,31 +903,31 @@ class ResumeTests(unittest.TestCase):
         )
         local_rollout = BASELINE_ROLLOUT + local_record
         self.local_rollout.write_bytes(local_rollout)
-        modal = _FakeModal({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
+        runloop = _FakeRunloop({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
 
         with self.assertRaisesRegex(
             ResumeError, "local|changed|advance|baseline|conflict"
         ):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), local_rollout)
 
     def test_missing_remote_session_index_preserves_local_index(self) -> None:
         local_index = (self.codex_home / "session_index.jsonl").read_bytes()
-        modal = _FakeModal({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
+        runloop = _FakeRunloop({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
 
         resume_remote_session(
-            sandbox_id=SANDBOX_ID,
+            devbox_id=DEVBOX_ID,
             workspace=self.workspace,
             codex_home=self.codex_home,
             receipt_path=self.receipt,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
         self.assertEqual(
@@ -938,14 +939,14 @@ class ResumeTests(unittest.TestCase):
     ) -> None:
         remote_rollout = BASELINE_ROLLOUT + REMOTE_RECORD
         self.local_rollout.write_bytes(remote_rollout)
-        modal = _FakeModal({ROLLOUT_PATH: remote_rollout})
+        runloop = _FakeRunloop({ROLLOUT_PATH: remote_rollout})
 
         result = resume_remote_session(
-            sandbox_id=SANDBOX_ID,
+            devbox_id=DEVBOX_ID,
             workspace=self.workspace,
             codex_home=self.codex_home,
             receipt_path=self.receipt,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
         self.assertEqual(result.session_id, SESSION_ID)
@@ -958,7 +959,7 @@ class ResumeTests(unittest.TestCase):
             + json.dumps({"id": SESSION_ID, "thread_name": "remote"})
             + "\n"
         ).encode("utf-8")
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {
                 ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD,
                 "session_index.jsonl": remote_index,
@@ -966,11 +967,11 @@ class ResumeTests(unittest.TestCase):
         )
 
         resume_remote_session(
-            sandbox_id=SANDBOX_ID,
+            devbox_id=DEVBOX_ID,
             workspace=self.workspace,
             codex_home=self.codex_home,
             receipt_path=self.receipt,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
         records = [
@@ -993,7 +994,7 @@ class ResumeTests(unittest.TestCase):
         remote_index = (
             json.dumps(unrelated_record) + "\n" + json.dumps(selected_record) + "\n"
         ).encode("utf-8")
-        modal: _FakeModal
+        runloop: _FakeRunloop
 
         def command_result(command: tuple[str, ...]) -> tuple[int, str, str] | None:
             if command[:2] == ("node", "-e"):
@@ -1007,7 +1008,7 @@ class ResumeTests(unittest.TestCase):
                 )
                 self.assertEqual(command[-1], SESSION_ID)
                 filtered_index = (json.dumps(selected_record) + "\n").encode("utf-8")
-                modal.sandbox.filesystem.archive_bytes = _tar_bytes(
+                runloop.devbox.filesystem.archive_bytes = _tar_bytes(
                     {
                         ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD,
                         "session_index.jsonl": filtered_index,
@@ -1015,7 +1016,7 @@ class ResumeTests(unittest.TestCase):
                 )
             return None
 
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {
                 ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD,
                 "session_index.jsonl": remote_index,
@@ -1024,15 +1025,15 @@ class ResumeTests(unittest.TestCase):
         )
 
         resume_remote_session(
-            sandbox_id=SANDBOX_ID,
+            devbox_id=DEVBOX_ID,
             workspace=self.workspace,
             codex_home=self.codex_home,
             receipt_path=self.receipt,
-            modal_module=modal,
+            runloop_client=runloop,
         )
 
-        self.assertEqual(len(modal.sandbox.filesystem.copied_archives), 1)
-        copied_archive = modal.sandbox.filesystem.copied_archives[0]
+        self.assertEqual(len(runloop.devbox.filesystem.copied_archives), 1)
+        copied_archive = runloop.devbox.filesystem.copied_archives[0]
         with tarfile.open(fileobj=io.BytesIO(copied_archive), mode="r:gz") as archive:
             index_source = archive.extractfile("session_index.jsonl")
             self.assertIsNotNone(index_source)
@@ -1044,7 +1045,7 @@ class ResumeTests(unittest.TestCase):
             any(
                 command[:2] == ("rmdir", "--")
                 and command[-1].startswith("/tmp/baton-session-index-")
-                for command in modal.sandbox.commands
+                for command in runloop.devbox.commands
             )
         )
 
@@ -1053,7 +1054,7 @@ class ResumeTests(unittest.TestCase):
         remote_index = (
             json.dumps({"id": SESSION_ID, "thread_name": "remote"}) + "\n"
         ).encode("utf-8")
-        modal = _FakeModal(
+        runloop = _FakeRunloop(
             {
                 ROLLOUT_PATH: remote_rollout,
                 "session_index.jsonl": remote_index,
@@ -1073,28 +1074,28 @@ class ResumeTests(unittest.TestCase):
             self.assertRaisesRegex(ResumeError, "restore local session index"),
         ):
             resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
         self.assertEqual(local_index_path.read_bytes(), original_index)
 
     def test_launch_uses_local_codex_home_workspace_and_safe_argv(self) -> None:
-        modal = _FakeModal({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
+        runloop = _FakeRunloop({ROLLOUT_PATH: BASELINE_ROLLOUT + REMOTE_RECORD})
 
         with patch("baton.resume.subprocess.run") as run:
             run.return_value.returncode = 0
             result = resume_remote_session(
-                sandbox_id=SANDBOX_ID,
+                devbox_id=DEVBOX_ID,
                 workspace=self.workspace,
                 codex_home=self.codex_home,
                 receipt_path=self.receipt,
                 launch=True,
-                modal_module=modal,
+                runloop_client=runloop,
             )
 
         positional, keywords = run.call_args
@@ -1152,7 +1153,7 @@ class _Filesystem:
         destination.write_bytes(self.archive_bytes)
 
 
-class _Sandbox:
+class _RemoteDevboxState:
     def __init__(
         self,
         members: dict[str, bytes],
@@ -1193,40 +1194,68 @@ class _Sandbox:
         self.detached = True
 
 
-class _SandboxFactory:
-    def __init__(self, sandbox: _Sandbox) -> None:
-        self.sandbox = sandbox
-        self.from_id_calls: list[str] = []
+class _Executions:
+    def __init__(self, devbox: _RemoteDevboxState) -> None:
+        self.devbox = devbox
+        self.processes: dict[str, _Process] = {}
+        self.rendered_commands: list[str] = []
+
+    def execute_async(self, devbox_id: str, *, command: str) -> object:
+        self._require_devbox(devbox_id)
+        self.rendered_commands.append(command)
+        argv = shlex.split(command)
+        if argv[:3] != ["timeout", "--preserve-status", "120"]:
+            raise AssertionError(f"missing bounded Runloop command timeout: {argv!r}")
+        execution_id = f"execution-{len(self.processes) + 1}"
+        self.processes[execution_id] = self.devbox.exec(*argv[3:])
+        return SimpleNamespace(execution_id=execution_id)
+
+    def await_completed(self, execution_id: str, *, devbox_id: str) -> object:
+        self._require_devbox(devbox_id)
+        process = self.processes[execution_id]
+        return SimpleNamespace(
+            exit_status=process.returncode,
+            stdout=process.stdout.read(),
+            stderr=process.stderr.read(),
+        )
+
+    def _require_devbox(self, devbox_id: str) -> None:
+        if devbox_id != DEVBOX_ID:
+            raise AssertionError(f"unexpected Devbox ID: {devbox_id}")
+
+
+class _Devboxes:
+    def __init__(self, devbox: _RemoteDevboxState) -> None:
+        self.devbox = devbox
+        self.executions = _Executions(devbox)
+        self.retrieve_calls: list[str] = []
         self.create_calls: list[dict[str, object]] = []
+        self.shutdown_calls: list[str] = []
 
-    def from_id(self, sandbox_id: str) -> _Sandbox:
-        self.from_id_calls.append(sandbox_id)
-        return self.sandbox
+    def retrieve(self, devbox_id: str) -> object:
+        self.retrieve_calls.append(devbox_id)
+        return SimpleNamespace(id=devbox_id)
 
-    def create(self, **kwargs: object) -> _Sandbox:
-        self.create_calls.append(kwargs)
-        return self.sandbox
+    def read_file_contents(self, devbox_id: str, *, file_path: str) -> str:
+        self._require_devbox(devbox_id)
+        return self.devbox.filesystem.read_text(file_path)
 
+    def download_file(self, devbox_id: str, *, path: str) -> bytes:
+        self._require_devbox(devbox_id)
+        filesystem = self.devbox.filesystem
+        filesystem.copy_calls.append((path, Path("<runloop-download>")))
+        filesystem.copied_archives.append(filesystem.archive_bytes)
+        return filesystem.archive_bytes
 
-class _App:
-    def __init__(self, parent: _FakeModal) -> None:
-        self.parent = parent
+    def shutdown(self, devbox_id: str) -> None:
+        self.shutdown_calls.append(devbox_id)
 
-    def lookup(self, name: str, *, create_if_missing: bool) -> object:
-        self.parent.app_lookup_calls.append((name, create_if_missing))
-        return object()
-
-
-class _Secret:
-    def __init__(self, parent: _FakeModal) -> None:
-        self.parent = parent
-
-    def from_name(self, name: str, **kwargs: object) -> object:
-        self.parent.secret_calls.append((name, kwargs))
-        return object()
+    def _require_devbox(self, devbox_id: str) -> None:
+        if devbox_id != DEVBOX_ID:
+            raise AssertionError(f"unexpected Devbox ID: {devbox_id}")
 
 
-class _FakeModal:
+class _FakeRunloop:
     def __init__(
         self,
         members: dict[str, bytes],
@@ -1237,17 +1266,13 @@ class _FakeModal:
         ]
         | None = None,
     ) -> None:
-        self.app_lookup_calls: list[tuple[str, bool]] = []
-        self.secret_calls: list[tuple[str, dict[str, object]]] = []
-        self.sandbox = _Sandbox(
+        self.devbox = _RemoteDevboxState(
             members,
             marker,
             archive_bytes=archive_bytes,
             command_result=command_result,
         )
-        self.Sandbox = _SandboxFactory(self.sandbox)
-        self.App = _App(self)
-        self.Secret = _Secret(self)
+        self.devboxes = _Devboxes(self.devbox)
 
 
 def _write_snapshot(

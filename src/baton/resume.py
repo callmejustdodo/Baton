@@ -22,7 +22,7 @@ from .fetch import (
     REMOTE_COMPLETION_MARKER,
     HandoffReceipt,
     _load_handoff_receipt,
-    _normalize_sandbox_id,
+    _normalize_devbox_id,
     _workspace_fingerprint,
     _workspace_state_directory,
     _workspace_state_path,
@@ -34,6 +34,7 @@ from .handoff import (
     SnapshotArchive,
     inspect_snapshot_archive,
 )
+from .runloop import RunloopClientError, load_runloop_client, open_devbox
 
 REMOTE_CODEX_HOME = "/baton/.codex"
 SESSION_BACKUPS_DIRECTORY = Path(".baton") / "session-backups"
@@ -93,7 +94,7 @@ class _GitState:
 class ResumeResult:
     """The local result of recovering one completed remote Codex session."""
 
-    sandbox_id: str
+    devbox_id: str
     session_id: str
     archive: Path
     fetch_root: Path
@@ -106,7 +107,7 @@ class ResumeResult:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "sandbox_id": self.sandbox_id,
+            "devbox_id": self.devbox_id,
             "session_id": self.session_id,
             "archive": str(self.archive),
             "fetch_root": str(self.fetch_root),
@@ -123,30 +124,30 @@ class ResumeResult:
 
 def resume_remote_session(
     *,
-    sandbox_id: str,
+    devbox_id: str,
     workspace: Path,
     codex_home: Path,
     receipt_path: Path | None = None,
     fetch_root: Path | None = None,
     launch: bool = False,
-    modal_module: Any | None = None,
+    runloop_client: Any | None = None,
 ) -> ResumeResult:
     """Recover the selected rollout from a completed detached handoff.
 
     Only the manifest-selected transcript and its matching session-index metadata
-    are read from the Sandbox.  Runtime state such as ``auth.json``, SQLite
+    are read from the Devbox.  Runtime state such as ``auth.json``, SQLite
     databases, plugins, logs, and locks intentionally stays remote.
     """
 
-    normalized_sandbox_id = _normalize_sandbox_id_or_raise(sandbox_id)
+    normalized_devbox_id = _normalize_devbox_id_or_raise(devbox_id)
     source_workspace = _existing_directory(workspace, "workspace")
     local_codex_home = _existing_directory(codex_home, "CODEX_HOME")
     resolved_receipt_path = _receipt_path(
         source_workspace,
-        normalized_sandbox_id,
+        normalized_devbox_id,
         receipt_path,
     )
-    receipt = _load_receipt(resolved_receipt_path, normalized_sandbox_id)
+    receipt = _load_receipt(resolved_receipt_path, normalized_devbox_id)
     if receipt.workspace != source_workspace:
         raise ResumeError(
             "handoff receipt belongs to a different workspace; resume from the original "
@@ -166,13 +167,15 @@ def resume_remote_session(
     )
     _validate_rollout_bytes(baseline_rollout, receipt.session_id, "snapshot rollout")
 
-    modal = modal_module or _load_modal()
+    client = runloop_client
     try:
-        sandbox = modal.Sandbox.from_id(normalized_sandbox_id)
-    except Exception as error:
-        raise ResumeError(f"Modal Sandbox lookup failed: {error}") from error
+        if client is None:
+            client = load_runloop_client()
+        devbox = open_devbox(client, normalized_devbox_id)
+    except RunloopClientError as error:
+        raise ResumeError(str(error)) from error
 
-    completion_marker = _completion_marker(sandbox)
+    completion_marker = _completion_marker(devbox)
     remote_exit_code = _completion_exit_code(completion_marker)
     baseline_git_state = _marker_git_state(completion_marker)
     if remote_exit_code != 0:
@@ -190,37 +193,37 @@ def resume_remote_session(
 
     try:
         _assert_git_state_matches_remote(
-            sandbox,
+            devbox,
             source_workspace,
             snapshot.repository,
             baseline_git_state,
         )
         remote_rollout_path = _remote_path(rollout_relative)
         _assert_remote_unlinked_regular_file(
-            sandbox,
+            devbox,
             remote_rollout_path,
             canonical_root=REMOTE_CODEX_HOME,
         )
         archive_members = [rollout_relative.as_posix()]
         total_payload_size = _assert_remote_file_size(
-            sandbox,
+            devbox,
             remote_rollout_path,
             label="selected remote rollout",
         )
-        if _remote_regular_file_exists(sandbox, f"{REMOTE_CODEX_HOME}/session_index.jsonl"):
+        if _remote_regular_file_exists(devbox, f"{REMOTE_CODEX_HOME}/session_index.jsonl"):
             remote_index_path = f"{REMOTE_CODEX_HOME}/session_index.jsonl"
             _assert_remote_unlinked_regular_file(
-                sandbox,
+                devbox,
                 remote_index_path,
                 canonical_root=REMOTE_CODEX_HOME,
             )
             _assert_remote_file_size(
-                sandbox,
+                devbox,
                 remote_index_path,
                 label="remote session index",
             )
             _run_checked(
-                sandbox,
+                devbox,
                 "mkdir",
                 "-m",
                 "700",
@@ -229,7 +232,7 @@ def resume_remote_session(
             )
             index_directory_created = True
             _run_checked(
-                sandbox,
+                devbox,
                 "node",
                 "-e",
                 _FILTER_SESSION_INDEX_SCRIPT,
@@ -237,9 +240,9 @@ def resume_remote_session(
                 remote_filtered_index,
                 receipt.session_id,
             )
-            _assert_remote_unlinked_regular_file(sandbox, remote_filtered_index)
+            _assert_remote_unlinked_regular_file(devbox, remote_filtered_index)
             total_payload_size += _assert_remote_file_size(
-                sandbox,
+                devbox,
                 remote_filtered_index,
                 label="filtered remote session index",
             )
@@ -250,7 +253,7 @@ def resume_remote_session(
             )
         if index_directory_created:
             _run_checked(
-                sandbox,
+                devbox,
                 "tar",
                 "--no-recursion",
                 "-czf",
@@ -264,7 +267,7 @@ def resume_remote_session(
             )
         else:
             _run_checked(
-                sandbox,
+                devbox,
                 "tar",
                 "--no-recursion",
                 "-C",
@@ -275,7 +278,7 @@ def resume_remote_session(
                 *archive_members,
             )
         _assert_remote_file_size(
-            sandbox,
+            devbox,
             remote_archive,
             label="temporary remote session archive",
         )
@@ -283,10 +286,10 @@ def resume_remote_session(
         with tempfile.TemporaryDirectory(prefix="baton-resume-") as temporary_directory:
             staging = Path(temporary_directory)
             downloaded_archive = staging / "remote-session.tar.gz"
-            sandbox.filesystem.copy_to_local(remote_archive, downloaded_archive)
+            devbox.filesystem.copy_to_local(remote_archive, downloaded_archive)
             _assert_local_archive_size(downloaded_archive)
             cleanup_error = _remove_remote_artifacts(
-                sandbox,
+                devbox,
                 remote_archive,
                 remote_index_directory if index_directory_created else None,
             )
@@ -315,7 +318,7 @@ def resume_remote_session(
             fetch_root=applied_fetch_root,
         )
         _assert_git_state_matches_remote(
-            sandbox,
+            devbox,
             source_workspace,
             snapshot.repository,
             baseline_git_state,
@@ -364,7 +367,7 @@ def resume_remote_session(
                 local_codex_home,
             )
         return ResumeResult(
-            sandbox_id=normalized_sandbox_id,
+            devbox_id=normalized_devbox_id,
             session_id=receipt.session_id,
             archive=receipt.archive,
             fetch_root=applied_fetch_root,
@@ -390,7 +393,7 @@ def resume_remote_session(
             None
             if artifacts_removed
             else _remove_remote_artifacts(
-                sandbox,
+                devbox,
                 remote_archive,
                 remote_index_directory if index_directory_created else None,
             )
@@ -404,14 +407,14 @@ def resume_remote_session(
                 primary_error.add_note(str(cleanup_error))
 
 
-def _normalize_sandbox_id_or_raise(sandbox_id: str) -> str:
+def _normalize_devbox_id_or_raise(devbox_id: str) -> str:
     try:
-        return _normalize_sandbox_id(sandbox_id)
+        return _normalize_devbox_id(devbox_id)
     except Exception as error:
         raise ResumeError(str(error)) from error
 
 
-def _receipt_path(workspace: Path, sandbox_id: str, receipt_path: Path | None) -> Path:
+def _receipt_path(workspace: Path, devbox_id: str, receipt_path: Path | None) -> Path:
     if receipt_path is not None:
         candidate = receipt_path.expanduser()
         if candidate.is_symlink():
@@ -421,12 +424,12 @@ def _receipt_path(workspace: Path, sandbox_id: str, receipt_path: Path | None) -
         receipts_directory = _workspace_state_path(workspace, HANDOFF_RECEIPTS_DIRECTORY)
     except Exception as error:
         raise ResumeError(str(error)) from error
-    return receipts_directory / f"{sandbox_id}.json"
+    return receipts_directory / f"{devbox_id}.json"
 
 
-def _load_receipt(path: Path, sandbox_id: str) -> HandoffReceipt:
+def _load_receipt(path: Path, devbox_id: str) -> HandoffReceipt:
     try:
-        return _load_handoff_receipt(path, sandbox_id)
+        return _load_handoff_receipt(path, devbox_id)
     except Exception as error:
         raise ResumeError(str(error)) from error
 
@@ -444,7 +447,7 @@ def _require_applied_workspace(
             fetches_directory = _workspace_state_path(workspace, FETCHES_DIRECTORY)
         except Exception as error:
             raise ResumeError(str(error)) from error
-        root = fetches_directory / receipt.sandbox_id
+        root = fetches_directory / receipt.devbox_id
     else:
         root = fetch_root.expanduser().resolve()
     if root.is_symlink() or not root.is_dir():
@@ -468,7 +471,7 @@ def _require_applied_workspace(
     if not isinstance(result, Mapping):
         raise ResumeError("the fetch artifact result.json is invalid")
     if (
-        result.get("sandbox_id") != receipt.sandbox_id
+        result.get("devbox_id") != receipt.devbox_id
         or result.get("session_id") != receipt.session_id
         or result.get("applied") is not True
         or result.get("apply_status") != "applied"
@@ -549,12 +552,12 @@ def _snapshot_member_bytes(archive_path: Path, member_path: PurePosixPath) -> by
     return contents
 
 
-def _completion_marker(sandbox: Any) -> Mapping[str, Any]:
+def _completion_marker(devbox: Any) -> Mapping[str, Any]:
     try:
-        raw_marker = sandbox.filesystem.read_text(REMOTE_COMPLETION_MARKER)
+        raw_marker = devbox.filesystem.read_text(REMOTE_COMPLETION_MARKER)
     except Exception as error:
         raise ResumeError(
-            "the remote handoff has not completed yet, or its Sandbox is unavailable; "
+            "the remote handoff has not completed yet, or its Devbox is unavailable; "
             "wait for Codex to finish before restoring its session"
         ) from error
     try:
@@ -574,7 +577,7 @@ def _completion_exit_code(marker: Mapping[str, Any]) -> int:
 
 
 def _marker_git_state(marker: Mapping[str, Any]) -> _GitState | None:
-    """Decode the immutable detached-handoff baseline when the Sandbox has one."""
+    """Decode the immutable detached-handoff baseline when the Devbox has one."""
 
     value = marker.get("git_state")
     if value is None:
@@ -598,29 +601,29 @@ def _remote_path(relative: PurePosixPath) -> str:
     return f"{REMOTE_CODEX_HOME}/{relative.as_posix()}"
 
 
-def _remote_regular_file_exists(sandbox: Any, remote_path: str) -> bool:
-    returncode, _, _ = _run_remote_command(sandbox, "test", "-f", remote_path)
+def _remote_regular_file_exists(devbox: Any, remote_path: str) -> bool:
+    returncode, _, _ = _run_remote_command(devbox, "test", "-f", remote_path)
     return returncode == 0
 
 
 def _assert_remote_unlinked_regular_file(
-    sandbox: Any,
+    devbox: Any,
     remote_path: str,
     *,
     canonical_root: str | None = None,
 ) -> None:
     if canonical_root is not None:
-        _assert_remote_canonical_path(sandbox, remote_path, canonical_root)
-    _run_checked(sandbox, "test", "-f", remote_path)
+        _assert_remote_canonical_path(devbox, remote_path, canonical_root)
+    _run_checked(devbox, "test", "-f", remote_path)
     try:
-        _run_checked(sandbox, "test", "!", "-L", remote_path)
+        _run_checked(devbox, "test", "!", "-L", remote_path)
     except ResumeError as error:
         raise ResumeError(
             "remote session state has a symlink; refusing to archive a file that could "
             f"point at credentials: {remote_path}"
         ) from error
     linked_path = _run_checked(
-        sandbox,
+        devbox,
         "find",
         remote_path,
         "-type",
@@ -638,7 +641,7 @@ def _assert_remote_unlinked_regular_file(
 
 
 def _assert_remote_canonical_path(
-    sandbox: Any,
+    devbox: Any,
     remote_path: str,
     canonical_root: str,
 ) -> None:
@@ -657,14 +660,14 @@ def _assert_remote_canonical_path(
 
     try:
         resolved_root = _run_checked(
-            sandbox,
+            devbox,
             "realpath",
             "-e",
             "--",
             canonical_root,
         ).strip()
         resolved_path = _run_checked(
-            sandbox,
+            devbox,
             "realpath",
             "-e",
             "--",
@@ -682,10 +685,10 @@ def _assert_remote_canonical_path(
         )
 
 
-def _assert_remote_file_size(sandbox: Any, remote_path: str, *, label: str) -> int:
+def _assert_remote_file_size(devbox: Any, remote_path: str, *, label: str) -> int:
     """Read one remote file size before transferring it to the laptop."""
 
-    output = _run_checked(sandbox, "stat", "-c", "%s", "--", remote_path).strip()
+    output = _run_checked(devbox, "stat", "-c", "%s", "--", remote_path).strip()
     if not output.isdecimal():
         raise ResumeError(f"could not determine size of {label}")
     size = int(output)
@@ -708,7 +711,7 @@ def _assert_local_archive_size(archive_path: Path) -> None:
 
 
 def _assert_git_state_matches_remote(
-    sandbox: Any,
+    devbox: Any,
     workspace: Path,
     repository: Mapping[str, Any],
     baseline_state: _GitState | None,
@@ -718,7 +721,7 @@ def _assert_git_state_matches_remote(
     expected_repository = repository.get("present")
     if not isinstance(expected_repository, bool):
         raise ResumeError("handoff snapshot has invalid Git metadata")
-    remote_state = _remote_git_state(sandbox)
+    remote_state = _remote_git_state(devbox)
     local_state = _local_git_state(workspace)
     if not expected_repository:
         if baseline_state is not None or remote_state is not None or local_state is not None:
@@ -776,7 +779,7 @@ def _checkout_state_matches(left: _GitState, right: _GitState) -> bool:
     )
 
 
-def _remote_git_state(sandbox: Any) -> _GitState | None:
+def _remote_git_state(devbox: Any) -> _GitState | None:
     def command(*arguments: str) -> tuple[str, ...]:
         return (
             "runuser",
@@ -790,7 +793,7 @@ def _remote_git_state(sandbox: Any) -> _GitState | None:
         )
 
     returncode, stdout, _ = _run_remote_command(
-        sandbox,
+        devbox,
         *command("rev-parse", "--is-inside-work-tree"),
     )
     if returncode != 0:
@@ -798,7 +801,7 @@ def _remote_git_state(sandbox: Any) -> _GitState | None:
     if stdout.strip() != "true":
         return None
     repository_root = _run_checked(
-        sandbox,
+        devbox,
         *command("rev-parse", "--show-toplevel"),
     ).strip()
     if repository_root != REMOTE_WORKSPACE:
@@ -807,13 +810,13 @@ def _remote_git_state(sandbox: Any) -> _GitState | None:
             "session against a nested or substituted repository"
         )
     return _GitState(
-        head=_run_checked(sandbox, *command("rev-parse", "HEAD")).strip(),
+        head=_run_checked(devbox, *command("rev-parse", "HEAD")).strip(),
         branch=_run_checked(
-            sandbox,
+            devbox,
             *command("branch", "--show-current"),
         ).strip(),
         status=_run_checked(
-            sandbox,
+            devbox,
             *command(
                 "status",
                 "--porcelain=v1",
@@ -825,15 +828,15 @@ def _remote_git_state(sandbox: Any) -> _GitState | None:
             ),
         ),
         index=_run_checked(
-            sandbox,
+            devbox,
             *command("ls-files", "--stage", "-z", "--"),
         ),
         index_flags=_run_checked(
-            sandbox,
+            devbox,
             *command("ls-files", "-v", "-z", "--"),
         ),
         refs=_run_checked(
-            sandbox,
+            devbox,
             *command(
                 "for-each-ref",
                 "--format=%(refname)%00%(objectname)%00%(symref)%00",
@@ -918,8 +921,8 @@ def _run_local_git(
     )
 
 
-def _run_checked(sandbox: Any, *command: str) -> str:
-    returncode, stdout, stderr = _run_remote_command(sandbox, *command)
+def _run_checked(devbox: Any, *command: str) -> str:
+    returncode, stdout, stderr = _run_remote_command(devbox, *command)
     if returncode != 0:
         detail = stderr.strip() or stdout.strip() or "no command output"
         raise ResumeError(
@@ -928,8 +931,8 @@ def _run_checked(sandbox: Any, *command: str) -> str:
     return stdout
 
 
-def _run_remote_command(sandbox: Any, *command: str) -> tuple[int, str, str]:
-    process = sandbox.exec(*command, timeout=120)
+def _run_remote_command(devbox: Any, *command: str) -> tuple[int, str, str]:
+    process = devbox.exec(*command, timeout=120)
     stdout = _read_all(process.stdout)
     stderr = _read_all(process.stderr)
     process.wait()
@@ -1212,7 +1215,6 @@ def _rollback_local_file(path: Path, previous_contents: bytes | None) -> OSError
         return error
     return None
 
-
 def _write_bytes_atomically(path: Path, contents: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -1267,7 +1269,7 @@ def _process_returncode(process: Any) -> int:
 
 
 def _remove_remote_artifacts(
-    sandbox: Any,
+    devbox: Any,
     remote_archive: str,
     remote_index_directory: str | None,
 ) -> ResumeError | None:
@@ -1287,7 +1289,7 @@ def _remove_remote_artifacts(
     errors: list[str] = []
     for command in commands:
         try:
-            _run_checked(sandbox, *command)
+            _run_checked(devbox, *command)
         except ResumeError as error:
             errors.append(str(error))
     if errors:
@@ -1295,11 +1297,3 @@ def _remove_remote_artifacts(
             "could not remove temporary remote session artifacts: " + "; ".join(errors)
         )
     return None
-
-
-def _load_modal() -> Any:
-    try:
-        import modal
-    except ImportError as error:
-        raise ResumeError("Modal SDK is required; install Baton with its Modal dependency") from error
-    return modal
