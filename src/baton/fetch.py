@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import UUID, uuid4
 
-from .handoff import HandoffError, inspect_snapshot_archive
+from .handoff import HandoffError, REMOTE_COMPLETION_MARKER, inspect_snapshot_archive
 from .snapshot import (
     EXCLUDED_PATH_COMPONENTS,
     KNOWN_SECRET_DIRECTORIES,
@@ -28,7 +28,6 @@ RECEIPT_FORMAT_VERSION = 1
 HANDOFF_RECEIPTS_DIRECTORY = Path(".baton") / "handoffs"
 FETCHES_DIRECTORY = Path(".baton") / "fetches"
 REMOTE_ROOT = "/baton"
-REMOTE_COMPLETION_MARKER = f"{REMOTE_ROOT}/handoff-complete.json"
 INTERNAL_WORKSPACE_COMPONENTS = frozenset({".baton", ".git", ".omc", ".omx"})
 NATIVE_ARTIFACT_SUFFIXES = frozenset({".dll", ".dylib", ".node", ".pyd", ".so"})
 NATIVE_BUILD_COMPONENTS = frozenset({".venv", "build", "dist", "node_modules", "venv"})

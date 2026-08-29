@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
-from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tarfile
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from threading import Thread
-from typing import Any, Callable, Mapping
+from typing import Any
 from uuid import UUID
 
 from .snapshot import ARCHIVE_FORMAT_VERSION
-
 
 DEFAULT_MODAL_APP = "baton"
 DEFAULT_MODAL_SECRET = "baton-openai"
@@ -22,7 +22,11 @@ REMOTE_ROOT = "/baton"
 REMOTE_STAGE = f"{REMOTE_ROOT}/stage"
 REMOTE_CODEX_HOME = f"{REMOTE_ROOT}/.codex"
 REMOTE_WORKSPACE = f"{REMOTE_ROOT}/workspace"
-REMOTE_COMPLETION_MARKER = f"{REMOTE_ROOT}/handoff-complete.json"
+REMOTE_RUNTIME_USER = "baton-agent"
+REMOTE_CONTROL_DIR = "/baton-control"
+REMOTE_COMPLETION_MARKER = f"{REMOTE_CONTROL_DIR}/handoff-complete.json"
+REMOTE_GIT_BASELINE = f"{REMOTE_CONTROL_DIR}/handoff-git-baseline.json"
+REMOTE_COMPLETION_TEMP = f"{REMOTE_CONTROL_DIR}/handoff-complete.tmp"
 GIT_BUNDLE_ARCHIVE = "git/repository.bundle"
 SETUP_COMMAND_TIMEOUT = 120
 NATIVE_ARTIFACT_SUFFIXES = frozenset({".dll", ".dylib", ".node", ".pyd", ".so"})
@@ -257,18 +261,41 @@ def handoff_archive(
         sandbox.filesystem.copy_from_local(snapshot.path, REMOTE_ARCHIVE)
         _restore_snapshot(sandbox, snapshot)
         _configure_api_key_auth(sandbox)
+        _configure_runtime_privilege_boundary(sandbox)
 
         if detach:
+            baseline_git_state = (
+                _capture_remote_git_state(sandbox) if snapshot.repository["present"] else None
+            )
+            _write_detached_git_baseline(sandbox, baseline_git_state)
             sandbox.exec(
                 "sh",
                 "-c",
                 (
+                    'baseline_path=$1; marker_temp=$2; marker_path=$3; runtime_user=$4; shift 4; '
+                    'baseline=$(cat -- "$baseline_path") || exit 2; '
                     'status=0; "$@" || status=$?; '
-                    f'printf \'{{"exit_code":%s}}\\n\' "$status" > {REMOTE_COMPLETION_MARKER}; '
+                    'pkill_status=0; /usr/bin/pkill -KILL -u "$runtime_user" '
+                    '2>/dev/null || pkill_status=$?; '
+                    'if [ "$pkill_status" -gt 1 ]; then exit 3; fi; '
+                    'printf \'{"exit_code":%s,"git_state":%s}\\n\' "$status" "$baseline" '
+                    '> "$marker_temp" || exit 3; chmod 600 "$marker_temp" || exit 3; '
+                    'mv -f -- "$marker_temp" "$marker_path" || exit 3; '
+                    'rm -f -- "$baseline_path" || exit 3; '
                     'exit "$status"'
                 ),
                 "baton-resume",
+                REMOTE_GIT_BASELINE,
+                REMOTE_COMPLETION_TEMP,
+                REMOTE_COMPLETION_MARKER,
+                REMOTE_RUNTIME_USER,
+                "runuser",
+                "--user",
+                REMOTE_RUNTIME_USER,
+                "--preserve-environment",
+                "--",
                 "env",
+                "HOME=/home/baton-agent",
                 f"CODEX_HOME={REMOTE_CODEX_HOME}",
                 *resume_command,
                 timeout=command_timeout,
@@ -285,7 +312,13 @@ def handoff_archive(
             )
 
         process = sandbox.exec(
+            "runuser",
+            "--user",
+            REMOTE_RUNTIME_USER,
+            "--preserve-environment",
+            "--",
             "env",
+            "HOME=/home/baton-agent",
             f"CODEX_HOME={REMOTE_CODEX_HOME}",
             *resume_command,
             timeout=command_timeout,
@@ -326,8 +359,17 @@ def _runtime_image(modal: Any, codex_version: str) -> Any:
 
     return (
         modal.Image.from_registry("node:22-bookworm-slim")
-        .apt_install("ca-certificates", "git", "gzip", "tar")
+        .apt_install(
+            "ca-certificates",
+            "git",
+            "gzip",
+            "passwd",
+            "procps",
+            "tar",
+            "util-linux",
+        )
         .run_commands(
+            f"useradd --create-home --shell /bin/bash {REMOTE_RUNTIME_USER}",
             f"npm install --global @openai/codex@{codex_version}",
             "codex --version",
             "git --version",
@@ -367,6 +409,65 @@ def _configure_api_key_auth(sandbox: Any) -> None:
             f"printf '%s\\n' \"$OPENAI_API_KEY\" | "
             f"env CODEX_HOME={REMOTE_CODEX_HOME} codex login --with-api-key"
         ),
+    )
+
+
+def _configure_runtime_privilege_boundary(sandbox: Any) -> None:
+    """Give Codex its mutable trees while keeping Baton control files root-only."""
+
+    _run_checked(sandbox, "mkdir", "-p", REMOTE_CONTROL_DIR)
+    _run_checked(sandbox, "chown", "root:root", REMOTE_ROOT, REMOTE_CONTROL_DIR)
+    _run_checked(sandbox, "chmod", "755", REMOTE_ROOT)
+    _run_checked(sandbox, "chmod", "700", REMOTE_CONTROL_DIR)
+    _run_checked(
+        sandbox,
+        "chown",
+        "-R",
+        f"{REMOTE_RUNTIME_USER}:{REMOTE_RUNTIME_USER}",
+        REMOTE_CODEX_HOME,
+        REMOTE_WORKSPACE,
+    )
+    _run_checked(
+        sandbox,
+        "runuser",
+        "--user",
+        REMOTE_RUNTIME_USER,
+        "--",
+        "test",
+        "-w",
+        REMOTE_CODEX_HOME,
+    )
+    _run_checked(
+        sandbox,
+        "runuser",
+        "--user",
+        REMOTE_RUNTIME_USER,
+        "--",
+        "test",
+        "-w",
+        REMOTE_WORKSPACE,
+    )
+    _run_checked(
+        sandbox,
+        "runuser",
+        "--user",
+        REMOTE_RUNTIME_USER,
+        "--",
+        "test",
+        "!",
+        "-w",
+        REMOTE_ROOT,
+    )
+    _run_checked(
+        sandbox,
+        "runuser",
+        "--user",
+        REMOTE_RUNTIME_USER,
+        "--",
+        "test",
+        "!",
+        "-r",
+        REMOTE_CONTROL_DIR,
     )
 
 
@@ -421,6 +522,104 @@ def _restore_git_workspace(sandbox: Any, repository: Mapping[str, Any]) -> None:
         f"{REMOTE_STAGE}/workspace/.",
         f"{REMOTE_WORKSPACE}/",
     )
+
+
+def _capture_remote_git_state(sandbox: Any) -> dict[str, str]:
+    """Capture the Git state before detached Codex is allowed to mutate it.
+
+    The completion marker retains this baseline so a later local session restore
+    can reject a remote commit, ref, index, or checkout change that fetch does
+    not reproduce locally.
+    """
+
+    repository_root = _run_checked(
+        sandbox,
+        "git",
+        "-C",
+        REMOTE_WORKSPACE,
+        "rev-parse",
+        "--show-toplevel",
+    ).strip()
+    if repository_root != REMOTE_WORKSPACE:
+        raise HandoffError(
+            "restored Git checkout is not rooted at the Baton workspace: "
+            f"{repository_root or 'no repository root'}"
+        )
+    return {
+        "head": _run_checked(
+            sandbox,
+            "git",
+            "-C",
+            REMOTE_WORKSPACE,
+            "rev-parse",
+            "HEAD",
+        ).strip(),
+        "branch": _run_checked(
+            sandbox,
+            "git",
+            "-C",
+            REMOTE_WORKSPACE,
+            "branch",
+            "--show-current",
+        ).strip(),
+        "status": _run_checked(
+            sandbox,
+            "git",
+            "-C",
+            REMOTE_WORKSPACE,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+            ":(exclude).baton",
+        ),
+        "index": _run_checked(
+            sandbox,
+            "git",
+            "-C",
+            REMOTE_WORKSPACE,
+            "ls-files",
+            "--stage",
+            "-z",
+            "--",
+        ),
+        "index_flags": _run_checked(
+            sandbox,
+            "git",
+            "-C",
+            REMOTE_WORKSPACE,
+            "ls-files",
+            "-v",
+            "-z",
+            "--",
+        ),
+        "refs": _run_checked(
+            sandbox,
+            "git",
+            "-C",
+            REMOTE_WORKSPACE,
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(symref)%00",
+        ),
+    }
+
+
+def _write_detached_git_baseline(
+    sandbox: Any,
+    git_state: Mapping[str, str] | None,
+) -> None:
+    """Write the JSON value used by the detached completion-marker wrapper."""
+
+    try:
+        sandbox.filesystem.write_text(
+            json.dumps(git_state, separators=(",", ":")),
+            REMOTE_GIT_BASELINE,
+        )
+    except Exception as error:
+        raise HandoffError(f"could not write detached Git baseline: {error}") from error
+    _run_checked(sandbox, "chmod", "600", REMOTE_GIT_BASELINE)
 
 
 def _assert_remote_workspace_portable(sandbox: Any) -> None:
@@ -760,11 +959,11 @@ def _cleanup_sandbox(sandbox: Any) -> HandoffError | None:
     failures: list[str] = []
     try:
         sandbox.terminate()
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - cleanup must report any Modal SDK failure
         failures.append(f"terminate failed: {error}")
     try:
         sandbox.detach()
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - cleanup must report any Modal SDK failure
         failures.append(f"detach failed: {error}")
     if failures:
         return HandoffError("Modal Sandbox cleanup failed: " + "; ".join(failures))

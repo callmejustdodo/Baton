@@ -20,7 +20,7 @@ from baton.fetch import (
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
 SANDBOX_ID = "sb-fetch-test"
-COMPLETION_PATH = "/baton/handoff-complete.json"
+COMPLETION_PATH = "/baton-control/handoff-complete.json"
 
 
 class FetchTests(unittest.TestCase):
