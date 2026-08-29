@@ -22,6 +22,7 @@ REMOTE_ROOT = "/baton"
 REMOTE_STAGE = f"{REMOTE_ROOT}/stage"
 REMOTE_CODEX_HOME = f"{REMOTE_ROOT}/.codex"
 REMOTE_WORKSPACE = f"{REMOTE_ROOT}/workspace"
+REMOTE_COMPLETION_MARKER = f"{REMOTE_ROOT}/handoff-complete.json"
 GIT_BUNDLE_ARCHIVE = "git/repository.bundle"
 SETUP_COMMAND_TIMEOUT = 120
 NATIVE_ARTIFACT_SUFFIXES = frozenset({".dll", ".dylib", ".node", ".pyd", ".so"})
@@ -257,13 +258,21 @@ def handoff_archive(
         _restore_snapshot(sandbox, snapshot)
         _configure_api_key_auth(sandbox)
 
-        process = sandbox.exec(
-            "env",
-            f"CODEX_HOME={REMOTE_CODEX_HOME}",
-            *resume_command,
-            timeout=command_timeout,
-        )
         if detach:
+            sandbox.exec(
+                "sh",
+                "-c",
+                (
+                    'status=0; "$@" || status=$?; '
+                    f'printf \'{{"exit_code":%s}}\\n\' "$status" > {REMOTE_COMPLETION_MARKER}; '
+                    'exit "$status"'
+                ),
+                "baton-resume",
+                "env",
+                f"CODEX_HOME={REMOTE_CODEX_HOME}",
+                *resume_command,
+                timeout=command_timeout,
+            )
             sandbox.detach()
             detached = True
             return HandoffResult(
@@ -275,6 +284,12 @@ def handoff_archive(
                 exit_code=None,
             )
 
+        process = sandbox.exec(
+            "env",
+            f"CODEX_HOME={REMOTE_CODEX_HOME}",
+            *resume_command,
+            timeout=command_timeout,
+        )
         event_count = _stream_codex_events(process, on_event)
         return HandoffResult(
             archive=snapshot.path,

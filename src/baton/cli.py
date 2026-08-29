@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
+from .fetch import FetchError, fetch_workspace, write_handoff_receipt
 from .handoff import (
     DEFAULT_MODAL_APP,
     DEFAULT_MODAL_SECRET,
@@ -119,6 +120,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="leave the remote Sandbox working after the local command exits",
     )
+
+    fetch_parser = subcommands.add_parser(
+        "fetch",
+        help="download a completed Modal Sandbox workspace for safe local review",
+    )
+    fetch_parser.add_argument("sandbox_id", help="Modal Sandbox object ID to fetch")
+    fetch_parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path.cwd(),
+        help="workspace containing the detached-handoff receipt (default: current directory)",
+    )
+    fetch_parser.add_argument(
+        "--receipt",
+        type=Path,
+        help="handoff receipt path (default: <workspace>/.baton/handoffs/<sandbox-id>.json)",
+    )
+    fetch_parser.add_argument(
+        "--output",
+        type=Path,
+        help="review directory (default: <workspace>/.baton/fetches/<sandbox-id>)",
+    )
     return parser
 
 
@@ -172,9 +195,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 detach=args.detach,
                 on_event=_print_handoff_event,
             )
-        except (SnapshotError, HandoffError) as error:
+            receipt_path = None
+            if result.detached:
+                receipt_path = write_handoff_receipt(
+                    sandbox_id=result.sandbox_id,
+                    session_id=result.session_id,
+                    archive_path=snapshot_result.path,
+                    workspace=args.workspace,
+                )
+        except (SnapshotError, HandoffError, FetchError) as error:
             parser.error(str(error))
-        print(json.dumps({"type": "handoff_complete", **result.to_dict()}, sort_keys=True))
+        payload = {"type": "handoff_complete", **result.to_dict()}
+        if receipt_path is not None:
+            payload["receipt"] = str(receipt_path)
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+
+    if args.command == "fetch":
+        try:
+            result = fetch_workspace(
+                sandbox_id=args.sandbox_id,
+                workspace=args.workspace,
+                receipt_path=args.receipt,
+                output=args.output,
+            )
+        except FetchError as error:
+            parser.error(str(error))
+        print(json.dumps({"type": "fetch_complete", **result.to_dict()}, sort_keys=True))
         return 0
 
     parser.error(f"unsupported command: {args.command}")

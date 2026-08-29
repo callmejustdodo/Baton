@@ -2,22 +2,22 @@ from __future__ import annotations
 
 import io
 import json
-from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from pathlib import Path
 
 from baton.handoff import (
-    HandoffError,
     REMOTE_ARCHIVE,
     REMOTE_CODEX_HOME,
+    REMOTE_COMPLETION_MARKER,
     REMOTE_WORKSPACE,
+    HandoffError,
     _runtime_image,
     build_resume_command,
     handoff_archive,
     inspect_snapshot_archive,
 )
-
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
 ROLLOUT_PATH = (
@@ -294,6 +294,13 @@ class HandoffTests(unittest.TestCase):
         self.assertIsNone(result.exit_code)
         self.assertFalse(modal.sandbox.terminated)
         self.assertTrue(modal.sandbox.detached)
+        completion_command = next(
+            command
+            for command, _ in modal.sandbox.commands
+            if command[0] == "sh" and REMOTE_COMPLETION_MARKER in command[2]
+        )
+        self.assertEqual(completion_command[3:6], ("baton-resume", "env", f"CODEX_HOME={REMOTE_CODEX_HOME}"))
+        self.assertIn('"$@"', completion_command[2])
 
     def test_runtime_image_bakes_pinned_codex_and_git_without_a_dockerfile(self) -> None:
         modal = _FakeModal()
