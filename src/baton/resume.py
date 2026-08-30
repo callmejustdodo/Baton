@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -38,6 +39,10 @@ from .runloop import RunloopClientError, load_runloop_client, open_devbox
 
 REMOTE_CODEX_HOME = "/baton/.codex"
 SESSION_BACKUPS_DIRECTORY = Path(".baton") / "session-backups"
+PREPARED_SESSION_DIRECTORY = "session-history"
+PREPARED_SESSION_ARCHIVE = "remote-session.tar.gz"
+PREPARED_SESSION_MANIFEST = "manifest.json"
+PREPARED_SESSION_FORMAT_VERSION = 1
 MAX_SESSION_ARCHIVE_BYTES = 512 * 1024 * 1024
 _FILTER_SESSION_INDEX_SCRIPT = """\
 const fs = require("fs");
@@ -122,6 +127,29 @@ class ResumeResult:
         }
 
 
+@dataclass(frozen=True)
+class _LocalRestorePlan:
+    """The already-validated local files that a restore may replace."""
+
+    rollout_path: Path
+    index_path: Path
+    current_rollout: bytes | None
+    current_index: bytes | None
+    merged_index: bytes | None
+    backups_directory: Path
+
+
+@dataclass(frozen=True)
+class _PreparedSessionPayload:
+    """Validated remote history retained locally before the workspace is changed."""
+
+    remote_rollout: bytes
+    remote_index: bytes | None
+    remote_exit_code: int
+    remote_git_state: _GitState | None
+    baseline_git_state: _GitState | None
+
+
 def resume_remote_session(
     *,
     devbox_id: str,
@@ -139,6 +167,60 @@ def resume_remote_session(
     databases, plugins, logs, and locks intentionally stays remote.
     """
 
+    result = _restore_remote_session(
+        devbox_id=devbox_id,
+        workspace=workspace,
+        codex_home=codex_home,
+        receipt_path=receipt_path,
+        fetch_root=fetch_root,
+        launch=launch,
+        runloop_client=runloop_client,
+        preflight_only=False,
+    )
+    assert result is not None
+    return result
+
+
+def preflight_remote_session_restore(
+    *,
+    devbox_id: str,
+    workspace: Path,
+    codex_home: Path,
+    fetch_root: Path,
+    receipt_path: Path | None = None,
+    runloop_client: Any | None = None,
+) -> None:
+    """Verify remote history and local Codex targets without changing either one.
+
+    ``baton fetch`` uses this before applying its workspace patch. It catches a
+    missing or unsafe CODEX_HOME, malformed remote history, and divergent local
+    transcript while the workspace is still untouched, then retains the verified
+    rollout in the fetch artifact for the later local restore.
+    """
+
+    _restore_remote_session(
+        devbox_id=devbox_id,
+        workspace=workspace,
+        codex_home=codex_home,
+        receipt_path=receipt_path,
+        fetch_root=fetch_root,
+        launch=False,
+        runloop_client=runloop_client,
+        preflight_only=True,
+    )
+
+
+def _restore_remote_session(
+    *,
+    devbox_id: str,
+    workspace: Path,
+    codex_home: Path,
+    receipt_path: Path | None,
+    fetch_root: Path | None,
+    launch: bool,
+    runloop_client: Any | None,
+    preflight_only: bool,
+) -> ResumeResult | None:
     normalized_devbox_id = _normalize_devbox_id_or_raise(devbox_id)
     source_workspace = _existing_directory(workspace, "workspace")
     local_codex_home = _existing_directory(codex_home, "CODEX_HOME")
@@ -153,10 +235,14 @@ def resume_remote_session(
             "handoff receipt belongs to a different workspace; resume from the original "
             "workspace so Baton can verify the handoff baseline"
         )
-    applied_fetch_root = _require_applied_workspace(
-        workspace=source_workspace,
-        receipt=receipt,
-        fetch_root=fetch_root,
+    applied_fetch_root = (
+        None
+        if preflight_only
+        else _require_applied_workspace(
+            workspace=source_workspace,
+            receipt=receipt,
+            fetch_root=fetch_root,
+        )
     )
 
     snapshot = _inspect_snapshot(receipt)
@@ -166,6 +252,27 @@ def resume_remote_session(
         PurePosixPath("codex") / rollout_relative,
     )
     _validate_rollout_bytes(baseline_rollout, receipt.session_id, "snapshot rollout")
+
+    if not preflight_only:
+        assert applied_fetch_root is not None
+        prepared_payload = _load_prepared_session_payload(
+            fetch_root=applied_fetch_root,
+            receipt=receipt,
+            rollout_relative=rollout_relative,
+        )
+        if prepared_payload is not None:
+            return _restore_prepared_session_payload(
+                devbox_id=normalized_devbox_id,
+                workspace=source_workspace,
+                codex_home=local_codex_home,
+                receipt=receipt,
+                snapshot=snapshot,
+                rollout_relative=rollout_relative,
+                baseline_rollout=baseline_rollout,
+                fetch_root=applied_fetch_root,
+                payload=prepared_payload,
+                launch=launch,
+            )
 
     client = runloop_client
     try:
@@ -192,12 +299,20 @@ def resume_remote_session(
     index_directory_created = False
 
     try:
-        _assert_git_state_matches_remote(
-            devbox,
-            source_workspace,
-            snapshot.repository,
-            baseline_git_state,
-        )
+        remote_git_state: _GitState | None = None
+        if preflight_only:
+            remote_git_state = _assert_remote_git_state_matches_baseline(
+                devbox,
+                snapshot.repository,
+                baseline_git_state,
+            )
+        else:
+            _assert_git_state_matches_remote(
+                devbox,
+                source_workspace,
+                snapshot.repository,
+                baseline_git_state,
+            )
         remote_rollout_path = _remote_path(rollout_relative)
         _assert_remote_unlinked_regular_file(
             devbox,
@@ -309,6 +424,30 @@ def resume_remote_session(
                 "refusing to overwrite the local session"
             )
 
+        if preflight_only:
+            _prepare_local_restore(
+                local_codex_home=local_codex_home,
+                rollout_relative=rollout_relative,
+                session_id=receipt.session_id,
+                remote_rollout=remote_rollout,
+                remote_index=remote_index,
+                workspace=source_workspace,
+            )
+            assert fetch_root is not None
+            _stage_prepared_session_payload(
+                fetch_root=fetch_root,
+                receipt=receipt,
+                rollout_relative=rollout_relative,
+                remote_rollout=remote_rollout,
+                remote_index=remote_index,
+                remote_exit_code=remote_exit_code,
+                remote_git_state=remote_git_state,
+                baseline_git_state=baseline_git_state,
+            )
+            return None
+
+        assert applied_fetch_root is not None
+
         # Downloading and validating a long transcript can take time. Recheck the
         # fetched checkout immediately before writing local session state so we do
         # not attach the remote conversation to a workspace that changed mid-restore.
@@ -324,38 +463,22 @@ def resume_remote_session(
             baseline_git_state,
         )
 
-        rollout_path = local_codex_home.joinpath(*rollout_relative.parts)
-        _assert_safe_codex_target(local_codex_home, rollout_path)
-        _assert_no_duplicate_local_rollout(
-            local_codex_home,
-            rollout_path,
-            receipt.session_id,
-        )
-        current_rollout = _read_optional_regular_file(rollout_path, "local rollout")
-        if current_rollout is not None:
-            _validate_rollout_bytes(current_rollout, receipt.session_id, "local rollout")
-        if current_rollout is not None and not remote_rollout.startswith(current_rollout):
-            raise ResumeError(
-                "the local rollout changed since handoff; refusing to overwrite a divergent "
-                "Codex session"
-            )
-
-        index_path = local_codex_home / "session_index.jsonl"
-        _assert_safe_codex_target(local_codex_home, index_path)
-        current_index = _read_optional_regular_file(index_path, "local session index")
-        merged_index = _merge_session_index(current_index, remote_index, receipt.session_id)
-        backups_directory = _workspace_state_directory_or_raise(
-            source_workspace,
-            SESSION_BACKUPS_DIRECTORY,
+        local_restore = _prepare_local_restore(
+            local_codex_home=local_codex_home,
+            rollout_relative=rollout_relative,
+            session_id=receipt.session_id,
+            remote_rollout=remote_rollout,
+            remote_index=remote_index,
+            workspace=source_workspace,
         )
         backup_path, index_backup_path = _restore_locally(
-            rollout_path=rollout_path,
-            index_path=index_path,
-            current_rollout=current_rollout,
-            current_index=current_index,
+            rollout_path=local_restore.rollout_path,
+            index_path=local_restore.index_path,
+            current_rollout=local_restore.current_rollout,
+            current_index=local_restore.current_index,
             remote_rollout=remote_rollout,
-            merged_index=merged_index,
-            backups_directory=backups_directory,
+            merged_index=local_restore.merged_index,
+            backups_directory=local_restore.backups_directory,
             session_id=receipt.session_id,
         )
 
@@ -371,7 +494,7 @@ def resume_remote_session(
             session_id=receipt.session_id,
             archive=receipt.archive,
             fetch_root=applied_fetch_root,
-            rollout_path=rollout_path,
+            rollout_path=local_restore.rollout_path,
             backup_path=backup_path,
             index_backup_path=index_backup_path,
             remote_exit_code=remote_exit_code,
@@ -405,6 +528,72 @@ def resume_remote_session(
                 primary_error.args = (f"{primary_error}; additionally, {cleanup_error}",)
             elif hasattr(primary_error, "add_note"):
                 primary_error.add_note(str(cleanup_error))
+
+
+def _restore_prepared_session_payload(
+    *,
+    devbox_id: str,
+    workspace: Path,
+    codex_home: Path,
+    receipt: HandoffReceipt,
+    snapshot: SnapshotArchive,
+    rollout_relative: PurePosixPath,
+    baseline_rollout: bytes,
+    fetch_root: Path,
+    payload: _PreparedSessionPayload,
+    launch: bool,
+) -> ResumeResult:
+    """Commit the already-downloaded history after the workspace patch is applied."""
+
+    if not payload.remote_rollout.startswith(baseline_rollout):
+        raise ResumeError(
+            "prepared remote rollout does not extend the immutable handoff baseline; "
+            "refusing to overwrite the local session"
+        )
+    _require_applied_workspace(
+        workspace=workspace,
+        receipt=receipt,
+        fetch_root=fetch_root,
+    )
+    _assert_prepared_git_state_matches_local(
+        workspace,
+        snapshot.repository,
+        payload.remote_git_state,
+        payload.baseline_git_state,
+    )
+    local_restore = _prepare_local_restore(
+        local_codex_home=codex_home,
+        rollout_relative=rollout_relative,
+        session_id=receipt.session_id,
+        remote_rollout=payload.remote_rollout,
+        remote_index=payload.remote_index,
+        workspace=workspace,
+    )
+    backup_path, index_backup_path = _restore_locally(
+        rollout_path=local_restore.rollout_path,
+        index_path=local_restore.index_path,
+        current_rollout=local_restore.current_rollout,
+        current_index=local_restore.current_index,
+        remote_rollout=payload.remote_rollout,
+        merged_index=local_restore.merged_index,
+        backups_directory=local_restore.backups_directory,
+        session_id=receipt.session_id,
+    )
+    local_exit_code: int | None = None
+    if launch:
+        local_exit_code = _launch_local_codex(receipt.session_id, workspace, codex_home)
+    return ResumeResult(
+        devbox_id=devbox_id,
+        session_id=receipt.session_id,
+        archive=receipt.archive,
+        fetch_root=fetch_root,
+        rollout_path=local_restore.rollout_path,
+        backup_path=backup_path,
+        index_backup_path=index_backup_path,
+        remote_exit_code=payload.remote_exit_code,
+        launched=launch,
+        local_exit_code=local_exit_code,
+    )
 
 
 def _normalize_devbox_id_or_raise(devbox_id: str) -> str:
@@ -449,7 +638,10 @@ def _require_applied_workspace(
             raise ResumeError(str(error)) from error
         root = fetches_directory / receipt.devbox_id
     else:
-        root = fetch_root.expanduser().resolve()
+        candidate_root = fetch_root.expanduser()
+        if candidate_root.is_symlink():
+            raise ResumeError(f"fetch artifact directory is not safe: {candidate_root}")
+        root = candidate_root.resolve()
     if root.is_symlink() or not root.is_dir():
         raise ResumeError(
             "no completed applied fetch was found for this handoff; run 'baton fetch' "
@@ -728,10 +920,14 @@ def _assert_git_state_matches_remote(
     expected_repository = repository.get("present")
     if not isinstance(expected_repository, bool):
         raise ResumeError("handoff snapshot has invalid Git metadata")
-    remote_state = _remote_git_state(devbox)
+    remote_state = _assert_remote_git_state_matches_baseline(
+        devbox,
+        repository,
+        baseline_state,
+    )
     local_state = _local_git_state(workspace)
     if not expected_repository:
-        if baseline_state is not None or remote_state is not None or local_state is not None:
+        if local_state is not None:
             raise ResumeError(
                 "Git repository state changed during a non-Git handoff; refusing to reopen "
                 "a session against a different checkout"
@@ -741,6 +937,38 @@ def _assert_git_state_matches_remote(
         raise ResumeError(
             "the remote or local Git checkout is missing; Baton cannot reopen a session "
             "against a different repository state"
+        )
+    if not _checkout_state_matches(remote_state, local_state):
+        raise ResumeError(
+            "remote Git state differs from the fetched local checkout (HEAD, branch, index, or "
+            "worktree state); "
+            "Baton fetches worktree files but does not recreate remote Git mutations. Restore "
+            "the matching Git state before reopening this session."
+        )
+
+
+def _assert_remote_git_state_matches_baseline(
+    devbox: Any,
+    repository: Mapping[str, Any],
+    baseline_state: _GitState | None,
+) -> _GitState | None:
+    """Verify remote Git metadata without requiring the local worktree to be applied yet."""
+
+    expected_repository = repository.get("present")
+    if not isinstance(expected_repository, bool):
+        raise ResumeError("handoff snapshot has invalid Git metadata")
+    remote_state = _remote_git_state(devbox)
+    if not expected_repository:
+        if baseline_state is not None or remote_state is not None:
+            raise ResumeError(
+                "Git repository state changed during a non-Git handoff; refusing to reopen "
+                "a session against a different checkout"
+            )
+        return None
+    if remote_state is None:
+        raise ResumeError(
+            "the remote Git checkout is missing; Baton cannot reopen a session against a "
+            "different repository state"
         )
     if baseline_state is None:
         raise ResumeError(
@@ -753,12 +981,47 @@ def _assert_git_state_matches_remote(
             "Baton fetches worktree files but does not recreate remote Git mutations. Restore "
             "the matching Git state before reopening this session."
         )
+    return remote_state
+
+
+def _assert_prepared_git_state_matches_local(
+    workspace: Path,
+    repository: Mapping[str, Any],
+    remote_state: _GitState | None,
+    baseline_state: _GitState | None,
+) -> None:
+    """Bind locally staged session history to the checkout it was preflighted against."""
+
+    expected_repository = repository.get("present")
+    if not isinstance(expected_repository, bool):
+        raise ResumeError("handoff snapshot has invalid Git metadata")
+    local_state = _local_git_state(workspace)
+    if not expected_repository:
+        if baseline_state is not None or remote_state is not None or local_state is not None:
+            raise ResumeError(
+                "Git repository state changed during a non-Git handoff; refusing to reopen "
+                "a session against a different checkout"
+            )
+        return
+    if remote_state is None or local_state is None:
+        raise ResumeError(
+            "the prepared remote or local Git checkout is missing; Baton cannot reopen a "
+            "session against a different repository state"
+        )
+    if baseline_state is None:
+        raise ResumeError(
+            "prepared session history has no Git baseline; Baton cannot prove that the "
+            "session still belongs to the captured repository state"
+        )
+    if not _git_metadata_matches_baseline(remote_state, baseline_state):
+        raise ResumeError(
+            "prepared remote Git state changed after handoff (commit, ref, index, or "
+            "checkout); refusing to reopen the session"
+        )
     if not _checkout_state_matches(remote_state, local_state):
         raise ResumeError(
-            "remote Git state differs from the fetched local checkout (HEAD, branch, index, or "
-            "worktree state); "
-            "Baton fetches worktree files but does not recreate remote Git mutations. Restore "
-            "the matching Git state before reopening this session."
+            "prepared remote Git state differs from the fetched local checkout (HEAD, "
+            "branch, index, or worktree state); refusing to reopen the session"
         )
 
 
@@ -996,6 +1259,198 @@ def _read_remote_session_archive(
     return contents[rollout_name], contents.get("session_index.jsonl")
 
 
+def _stage_prepared_session_payload(
+    *,
+    fetch_root: Path,
+    receipt: HandoffReceipt,
+    rollout_relative: PurePosixPath,
+    remote_rollout: bytes,
+    remote_index: bytes | None,
+    remote_exit_code: int,
+    remote_git_state: _GitState | None,
+    baseline_git_state: _GitState | None,
+) -> None:
+    """Retain the preflighted session payload next to the fetched workspace."""
+
+    root = _safe_fetch_root(fetch_root)
+    directory = root / PREPARED_SESSION_DIRECTORY
+    if directory.exists() or directory.is_symlink():
+        raise ResumeError(f"prepared session directory already exists: {directory}")
+    try:
+        directory.mkdir(mode=0o700)
+    except OSError as error:
+        raise ResumeError(f"could not create prepared session directory: {directory}") from error
+
+    archive_path = directory / PREPARED_SESSION_ARCHIVE
+    manifest_path = directory / PREPARED_SESSION_MANIFEST
+    try:
+        _write_prepared_session_archive(
+            archive_path,
+            rollout_relative,
+            remote_rollout,
+            remote_index,
+        )
+        _assert_local_archive_size(archive_path)
+        persisted_rollout, persisted_index = _read_remote_session_archive(
+            archive_path,
+            rollout_relative,
+        )
+        if persisted_rollout != remote_rollout or persisted_index != remote_index:
+            raise ResumeError("prepared session archive did not preserve the verified history")
+        manifest = {
+            "format_version": PREPARED_SESSION_FORMAT_VERSION,
+            "devbox_id": receipt.devbox_id,
+            "session_id": receipt.session_id,
+            "archive": str(receipt.archive),
+            "rollout_path": rollout_relative.as_posix(),
+            "remote_exit_code": remote_exit_code,
+            "remote_git_state": _git_state_to_dict(remote_git_state),
+            "baseline_git_state": _git_state_to_dict(baseline_git_state),
+        }
+        _write_bytes_atomically(
+            manifest_path,
+            (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8"),
+        )
+    except Exception as error:
+        shutil.rmtree(directory, ignore_errors=True)
+        if isinstance(error, ResumeError):
+            raise
+        raise ResumeError(f"could not stage the verified remote session history: {error}") from error
+
+
+def _write_prepared_session_archive(
+    path: Path,
+    rollout_relative: PurePosixPath,
+    remote_rollout: bytes,
+    remote_index: bytes | None,
+) -> None:
+    temporary_path = path.parent / f".{path.name}-{uuid4().hex}"
+    try:
+        with tarfile.open(temporary_path, "w:gz") as archive:
+            _add_prepared_session_member(
+                archive,
+                rollout_relative.as_posix(),
+                remote_rollout,
+            )
+            if remote_index is not None:
+                _add_prepared_session_member(archive, "session_index.jsonl", remote_index)
+        temporary_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(temporary_path, path)
+    except (OSError, tarfile.TarError) as error:
+        raise ResumeError(f"could not write prepared session archive: {error}") from error
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _add_prepared_session_member(
+    archive: tarfile.TarFile,
+    name: str,
+    contents: bytes,
+) -> None:
+    member = tarfile.TarInfo(name)
+    member.mode = stat.S_IRUSR | stat.S_IWUSR
+    member.size = len(contents)
+    archive.addfile(member, io.BytesIO(contents))
+
+
+def _load_prepared_session_payload(
+    *,
+    fetch_root: Path,
+    receipt: HandoffReceipt,
+    rollout_relative: PurePosixPath,
+) -> _PreparedSessionPayload | None:
+    """Read a preflighted payload, if this fetch was created by a newer Baton."""
+
+    root = _safe_fetch_root(fetch_root)
+    directory = root / PREPARED_SESSION_DIRECTORY
+    if not directory.exists() and not directory.is_symlink():
+        return None
+    if directory.is_symlink() or not directory.is_dir():
+        raise ResumeError(f"prepared session directory is not safe: {directory}")
+    archive_path = directory / PREPARED_SESSION_ARCHIVE
+    manifest_path = directory / PREPARED_SESSION_MANIFEST
+    if archive_path.is_symlink() or not archive_path.is_file():
+        raise ResumeError("prepared session archive is missing or unsafe")
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ResumeError("prepared session manifest is missing or unsafe")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ResumeError("prepared session manifest is not valid JSON") from error
+    if not isinstance(manifest, Mapping):
+        raise ResumeError("prepared session manifest is invalid")
+    if manifest.get("format_version") != PREPARED_SESSION_FORMAT_VERSION:
+        raise ResumeError("prepared session manifest has an unsupported format")
+    if manifest.get("devbox_id") != receipt.devbox_id or manifest.get("session_id") != receipt.session_id:
+        raise ResumeError("prepared session history belongs to a different handoff")
+    archive_value = manifest.get("archive")
+    if not isinstance(archive_value, str) or Path(archive_value).expanduser().resolve() != receipt.archive:
+        raise ResumeError("prepared session history belongs to a different snapshot")
+    if manifest.get("rollout_path") != rollout_relative.as_posix():
+        raise ResumeError("prepared session rollout path does not match the handoff")
+    if manifest.get("remote_exit_code") != 0:
+        raise ResumeError("prepared session history came from a failed remote handoff")
+    remote_git_state = _git_state_from_manifest(
+        manifest.get("remote_git_state"),
+        "prepared remote Git state",
+    )
+    baseline_git_state = _git_state_from_manifest(
+        manifest.get("baseline_git_state"),
+        "prepared Git baseline",
+    )
+    _assert_local_archive_size(archive_path)
+    remote_rollout, remote_index = _read_remote_session_archive(archive_path, rollout_relative)
+    _validate_rollout_bytes(remote_rollout, receipt.session_id, "prepared remote rollout")
+    return _PreparedSessionPayload(
+        remote_rollout=remote_rollout,
+        remote_index=remote_index,
+        remote_exit_code=0,
+        remote_git_state=remote_git_state,
+        baseline_git_state=baseline_git_state,
+    )
+
+
+def _safe_fetch_root(fetch_root: Path) -> Path:
+    candidate = fetch_root.expanduser()
+    if candidate.is_symlink():
+        raise ResumeError(f"fetch artifact directory is not safe: {candidate}")
+    root = candidate.resolve()
+    if not root.is_dir():
+        raise ResumeError(f"fetch artifact directory is not safe: {root}")
+    return root
+
+
+def _git_state_to_dict(state: _GitState | None) -> dict[str, str] | None:
+    if state is None:
+        return None
+    return {
+        "head": state.head,
+        "branch": state.branch,
+        "status": state.status,
+        "index": state.index,
+        "index_flags": state.index_flags,
+        "refs": state.refs,
+    }
+
+
+def _git_state_from_manifest(value: object, label: str) -> _GitState | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ResumeError(f"{label} is invalid")
+    required = ("head", "branch", "status", "index", "index_flags", "refs")
+    if any(not isinstance(value.get(key), str) for key in required):
+        raise ResumeError(f"{label} is invalid")
+    return _GitState(
+        head=value["head"],
+        branch=value["branch"],
+        status=value["status"],
+        index=value["index"],
+        index_flags=value["index_flags"],
+        refs=value["refs"],
+    )
+
+
 def _safe_member_path(value: str) -> PurePosixPath:
     path = PurePosixPath(value)
     if not value or "\x00" in value or path.is_absolute():
@@ -1141,6 +1596,46 @@ def _merge_session_index(
             if not isinstance(record, Mapping) or record.get("id") != session_id:
                 retained_lines.append(line)
     return ("\n".join([*retained_lines, *selected_lines]) + "\n").encode("utf-8")
+
+
+def _prepare_local_restore(
+    *,
+    local_codex_home: Path,
+    rollout_relative: PurePosixPath,
+    session_id: str,
+    remote_rollout: bytes,
+    remote_index: bytes | None,
+    workspace: Path,
+) -> _LocalRestorePlan:
+    """Read and validate the local files that a restore would replace."""
+
+    rollout_path = local_codex_home.joinpath(*rollout_relative.parts)
+    _assert_safe_codex_target(local_codex_home, rollout_path)
+    _assert_no_duplicate_local_rollout(local_codex_home, rollout_path, session_id)
+    current_rollout = _read_optional_regular_file(rollout_path, "local rollout")
+    if current_rollout is not None:
+        _validate_rollout_bytes(current_rollout, session_id, "local rollout")
+    if current_rollout is not None and not remote_rollout.startswith(current_rollout):
+        raise ResumeError(
+            "the local rollout changed since handoff; refusing to overwrite a divergent "
+            "Codex session"
+        )
+
+    index_path = local_codex_home / "session_index.jsonl"
+    _assert_safe_codex_target(local_codex_home, index_path)
+    current_index = _read_optional_regular_file(index_path, "local session index")
+    merged_index = _merge_session_index(current_index, remote_index, session_id)
+    return _LocalRestorePlan(
+        rollout_path=rollout_path,
+        index_path=index_path,
+        current_rollout=current_rollout,
+        current_index=current_index,
+        merged_index=merged_index,
+        backups_directory=_workspace_state_directory_or_raise(
+            workspace,
+            SESSION_BACKUPS_DIRECTORY,
+        ),
+    )
 
 
 def _workspace_state_directory_or_raise(workspace: Path, relative_path: Path) -> Path:

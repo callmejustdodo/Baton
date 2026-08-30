@@ -17,6 +17,7 @@ from baton.fetch import (
     _apply_workspace_patch,
     fetch_workspace,
     list_handoff_receipts,
+    record_fetch_session_restore,
 )
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
@@ -73,6 +74,15 @@ class FetchTests(unittest.TestCase):
 
         self.assertEqual([receipt.devbox_id for receipt in receipts], [DEVBOX_ID])
         self.assertEqual(receipts[0].path, self.receipt.resolve())
+        self.assertEqual(receipts[0].session_title, "Original Codex session")
+
+    def test_receipt_without_title_metadata_remains_fetchable(self) -> None:
+        _write_snapshot(self.snapshot, include_session_index=False)
+
+        receipts = list_handoff_receipts(workspace=self.workspace)
+
+        self.assertEqual(len(receipts), 1)
+        self.assertIsNone(receipts[0].session_title)
 
     def test_modal_receipt_format_is_rejected_before_runloop_lookup(self) -> None:
         payload = json.loads(self.receipt.read_text(encoding="utf-8"))
@@ -165,9 +175,11 @@ class FetchTests(unittest.TestCase):
         self.assertTrue(result.applied)
         self.assertTrue(result.to_dict()["applied"])
         self.assertEqual(result.to_dict()["devbox_id"], DEVBOX_ID)
+        self.assertEqual(result.to_dict()["session_title"], "Original Codex session")
         self.assertNotIn("sandbox_id", result.to_dict())
         persisted_result = json.loads((output / "result.json").read_text(encoding="utf-8"))
         self.assertTrue(persisted_result["applied"])
+        self.assertEqual(persisted_result["session_title"], "Original Codex session")
         self.assertEqual((self.workspace / "app.py").read_text(), "print('remote')\n")
         self.assertEqual((self.workspace / "new.txt").read_text(), "fresh\n")
         self.assertFalse((self.workspace / "keep.txt").exists())
@@ -178,6 +190,112 @@ class FetchTests(unittest.TestCase):
         )
         self.assertEqual(runloop.devboxes.create_calls, [])
         self.assertEqual(runloop.devboxes.shutdown_calls, [])
+
+    def test_session_history_preflight_runs_before_workspace_application(self) -> None:
+        runloop = _FakeRunloop({"workspace/app.py": b"print('remote')\n"})
+        events: list[str] = []
+        original_apply = fetch_module._apply_workspace_patch
+
+        def preflight(result: FetchResult) -> None:
+            events.append("preflight")
+            self.assertFalse(result.applied)
+            self.assertEqual(
+                (self.workspace / "app.py").read_text(encoding="utf-8"),
+                "print('local')\n",
+            )
+
+        def track_apply(
+            workspace: Path,
+            baseline_workspace: Path,
+            patch_path: Path,
+            *,
+            snapshot_archive: Path | None = None,
+            ignored_paths: tuple[Path, ...] = (),
+        ) -> None:
+            events.append("apply")
+            original_apply(
+                workspace,
+                baseline_workspace,
+                patch_path,
+                snapshot_archive=snapshot_archive,
+                ignored_paths=ignored_paths,
+            )
+
+        with patch("baton.fetch._apply_workspace_patch", side_effect=track_apply):
+            result = fetch_workspace(
+                devbox_id=DEVBOX_ID,
+                workspace=self.workspace,
+                receipt_path=self.receipt,
+                runloop_client=runloop,
+                before_apply=preflight,
+            )
+
+        self.assertTrue(result.applied)
+        self.assertEqual(events, ["preflight", "apply"])
+        self.assertEqual(
+            (self.workspace / "app.py").read_text(encoding="utf-8"),
+            "print('remote')\n",
+        )
+
+    def test_session_history_preflight_failure_preserves_workspace_and_result(self) -> None:
+        runloop = _FakeRunloop({"workspace/app.py": b"print('remote')\n"})
+        before = _workspace_files(self.workspace)
+
+        def preflight(result: FetchResult) -> None:
+            record_fetch_session_restore(
+                fetch_root=result.fetch_root,
+                session_restore={
+                    "status": "failed",
+                    "phase": "preflight",
+                    "error": "remote transcript is unsafe",
+                },
+            )
+            raise FetchError("remote transcript is unsafe")
+
+        with self.assertRaisesRegex(FetchError, "session history failed validation"):
+            fetch_workspace(
+                devbox_id=DEVBOX_ID,
+                workspace=self.workspace,
+                receipt_path=self.receipt,
+                runloop_client=runloop,
+                before_apply=preflight,
+            )
+
+        self.assertEqual(_workspace_files(self.workspace), before)
+        result_payload = json.loads(
+            (self.workspace / ".baton/fetches" / DEVBOX_ID / "result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(result_payload["applied"])
+        self.assertEqual(result_payload["apply_status"], "session_preflight_failed")
+        self.assertEqual(result_payload["session_restore"]["status"], "failed")
+
+    def test_session_restore_status_is_persisted_with_the_fetch_artifact(self) -> None:
+        runloop = _FakeRunloop({"workspace/app.py": b"print('remote')\n"})
+
+        result = fetch_workspace(
+            devbox_id=DEVBOX_ID,
+            workspace=self.workspace,
+            receipt_path=self.receipt,
+            runloop_client=runloop,
+            apply_changes=False,
+        )
+        record_fetch_session_restore(
+            fetch_root=result.fetch_root,
+            session_restore={
+                "status": "skipped",
+                "reason": "review_only",
+            },
+        )
+
+        result_payload = json.loads(
+            (result.fetch_root / "result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            result_payload["session_restore"],
+            {"status": "skipped", "reason": "review_only"},
+        )
 
     def test_fetch_with_apply_changes_false_leaves_workspace_unchanged(self) -> None:
         runloop = _FakeRunloop(
@@ -603,19 +721,29 @@ class _FakeRunloop:
         self.devboxes = _Devboxes(members, marker)
 
 
-def _write_snapshot(path: Path) -> None:
+def _write_snapshot(path: Path, *, include_session_index: bool = True) -> None:
     rollout = f"codex/sessions/2026/08/23/rollout-{SESSION_ID}.jsonl"
     manifest = {
         "format_version": 1,
         "session": {"id": SESSION_ID, "rollout_archive_path": rollout},
         "repository": {"present": False},
     }
-    members = {
+    members: dict[str, bytes] = {
         "manifest.json": json.dumps(manifest).encode(),
         rollout: json.dumps({"payload": {"session_id": SESSION_ID}}).encode() + b"\n",
         "workspace/app.py": b"print('local')\n",
         "workspace/keep.txt": b"unchanged\n",
     }
+    if include_session_index:
+        members["codex/session_index.jsonl"] = (
+            json.dumps(
+                {
+                    "id": SESSION_ID,
+                    "thread_name": "Original Codex session",
+                }
+            ).encode()
+            + b"\n"
+        )
     path.write_bytes(_tar_bytes(members))
 
 

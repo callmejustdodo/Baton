@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from pathlib import Path
 
 from baton.snapshot import SnapshotError, snapshot
-
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
 OTHER_SESSION_ID = "019f5ef4-780a-7973-a1d2-c42661d5f05d"
@@ -97,6 +96,7 @@ class SnapshotTests(unittest.TestCase):
         )
         self.assertNotIn(OTHER_SESSION_ID, index)
         self.assertEqual(manifest["session"]["id"], SESSION_ID)
+        self.assertEqual(manifest["session"]["title"], "selected")
         self.assertFalse(manifest["security"]["codex_oauth_included"])
         self.assertTrue(manifest["security"]["known_workspace_credential_paths_rejected"])
         self.assertNotIn("openai_api_key_included", manifest["security"])

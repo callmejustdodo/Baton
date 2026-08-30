@@ -12,8 +12,10 @@ from uuid import UUID
 
 from .fetch import (
     FetchError,
+    FetchResult,
     fetch_workspace,
     list_handoff_receipts,
+    record_fetch_session_restore,
     write_handoff_receipt,
 )
 from .handoff import (
@@ -32,7 +34,12 @@ from .picker import (
     choose_session,
     list_local_sessions,
 )
-from .resume import ResumeError, resume_remote_session
+from .progress import TerminalSpinner
+from .resume import (
+    ResumeError,
+    preflight_remote_session_restore,
+    resume_remote_session,
+)
 from .runloop import RunloopClientError, validate_account_secret_name
 from .snapshot import SnapshotError, snapshot
 
@@ -180,6 +187,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="fetch artifact directory (default: <workspace>/.baton/fetches/<devbox-id>)",
     )
     fetch_parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")),
+        help=(
+            "local CODEX_HOME to restore the fetched session into "
+            "(default: $CODEX_HOME or ~/.codex)"
+        ),
+    )
+    fetch_parser.add_argument(
         "--no-apply",
         dest="apply_changes",
         action="store_false",
@@ -248,11 +264,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "prepare":
         try:
-            codex_version = args.codex_version or infer_local_codex_version()
-            result = prepare_runtime(
-                codex_version=codex_version,
-                blueprint_name=args.blueprint_name,
-            )
+            with TerminalSpinner("Preparing Runloop runtime..."):
+                codex_version = args.codex_version or infer_local_codex_version()
+                result = prepare_runtime(
+                    codex_version=codex_version,
+                    blueprint_name=args.blueprint_name,
+                )
         except HandoffError as error:
             parser.error(str(error))
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -261,33 +278,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "handoff":
         try:
             session_id, follow_up_prompt = _resolve_handoff_selection(args)
-            snapshot_result = snapshot(
-                session_id=session_id,
-                workspace=args.workspace,
-                codex_home=args.codex_home,
-                output=args.output,
-            )
-            blueprint_name = args.blueprint_name or blueprint_name_for_version(
-                infer_local_codex_version()
-            )
-            result = handoff_archive(
-                archive_path=snapshot_result.path,
-                prompt=follow_up_prompt,
-                runloop_secret=args.secret_name,
-                blueprint_name=blueprint_name,
-                idle_suspend_seconds=args.idle_suspend,
-                command_timeout=args.timeout,
-                detach=args.detach,
-                on_event=_print_handoff_event,
-            )
-            receipt_path = None
-            if result.detached:
-                receipt_path = write_handoff_receipt(
-                    devbox_id=result.devbox_id,
-                    session_id=result.session_id,
-                    archive_path=snapshot_result.path,
+            with TerminalSpinner("Handing off Codex session..."):
+                snapshot_result = snapshot(
+                    session_id=session_id,
                     workspace=args.workspace,
+                    codex_home=args.codex_home,
+                    output=args.output,
                 )
+                blueprint_name = args.blueprint_name or blueprint_name_for_version(
+                    infer_local_codex_version()
+                )
+                result = handoff_archive(
+                    archive_path=snapshot_result.path,
+                    prompt=follow_up_prompt,
+                    runloop_secret=args.secret_name,
+                    blueprint_name=blueprint_name,
+                    idle_suspend_seconds=args.idle_suspend,
+                    command_timeout=args.timeout,
+                    detach=args.detach,
+                    on_event=_print_handoff_event,
+                )
+                receipt_path = None
+                if result.detached:
+                    receipt_path = write_handoff_receipt(
+                        devbox_id=result.devbox_id,
+                        session_id=result.session_id,
+                        archive_path=snapshot_result.path,
+                        workspace=args.workspace,
+                    )
         except PickerCancelled:
             print("Baton: selection cancelled", file=sys.stderr)
             return 130
@@ -302,19 +320,117 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "fetch":
         try:
             devbox_id, receipt_path = _resolve_fetch_selection(args)
-            result = fetch_workspace(
-                devbox_id=devbox_id,
-                workspace=args.workspace,
-                receipt_path=receipt_path,
-                output=args.output,
-                apply_changes=args.apply_changes,
-            )
+
+            def preflight_session_history(fetch_result: FetchResult) -> None:
+                try:
+                    preflight_remote_session_restore(
+                        devbox_id=devbox_id,
+                        workspace=args.workspace,
+                        codex_home=args.codex_home,
+                        fetch_root=fetch_result.fetch_root,
+                        receipt_path=receipt_path,
+                    )
+                except ResumeError as error:
+                    session_restore = {
+                        "status": "failed",
+                        "phase": "preflight",
+                        "error": str(error),
+                    }
+                    try:
+                        record_fetch_session_restore(
+                            fetch_root=fetch_result.fetch_root,
+                            session_restore=session_restore,
+                        )
+                    except FetchError as record_error:
+                        raise FetchError(
+                            f"{error}; additionally, Baton could not record the session "
+                            f"preflight failure: {record_error}"
+                        ) from error
+                    raise FetchError(str(error)) from error
+
+            with TerminalSpinner("Fetching remote changes..."):
+                result = fetch_workspace(
+                    devbox_id=devbox_id,
+                    workspace=args.workspace,
+                    receipt_path=receipt_path,
+                    output=args.output,
+                    apply_changes=args.apply_changes,
+                    before_apply=preflight_session_history if args.apply_changes else None,
+                )
+                restore_failed = False
+                if result.applied:
+                    try:
+                        restored_session = resume_remote_session(
+                            devbox_id=devbox_id,
+                            workspace=args.workspace,
+                            codex_home=args.codex_home,
+                            receipt_path=receipt_path,
+                            fetch_root=result.fetch_root,
+                            launch=False,
+                        )
+                    except ResumeError as error:
+                        session_restore = {
+                            "status": "failed",
+                            "phase": "restore",
+                            "error": str(error),
+                        }
+                        restore_failed = True
+                    else:
+                        session_restore = {
+                            "status": "restored",
+                            **restored_session.to_dict(),
+                        }
+                else:
+                    session_restore = {
+                        "status": "skipped",
+                        "reason": (
+                            "review_only"
+                            if not args.apply_changes
+                            else "remote_exit_nonzero"
+                        ),
+                    }
+                try:
+                    record_fetch_session_restore(
+                        fetch_root=result.fetch_root,
+                        session_restore=session_restore,
+                    )
+                except FetchError as error:
+                    session_restore = {
+                        **session_restore,
+                        "record_error": str(error),
+                    }
         except PickerCancelled:
             print("Baton: selection cancelled", file=sys.stderr)
             return 130
         except (FetchError, PickerError) as error:
             parser.error(str(error))
-        print(json.dumps({"type": "fetch_complete", **result.to_dict()}, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "type": "fetch_complete",
+                    **result.to_dict(),
+                    "session_restore": session_restore,
+                },
+                sort_keys=True,
+            )
+        )
+        if restore_failed:
+            if "record_error" in session_restore:
+                print(
+                    "Baton: remote workspace changes were applied, but its Codex session "
+                    "history was not restored and Baton could not update the fetch artifact. "
+                    "The structured output includes both errors; fix the issue and run "
+                    "'baton resume' to retry.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Baton: remote workspace changes were applied, but its Codex session "
+                    "history was not restored. The saved fetch artifact records the error; "
+                    "fix it and run 'baton resume' to retry.",
+                    file=sys.stderr,
+                )
+            return 1
         return 0
 
     if args.command == "resume":

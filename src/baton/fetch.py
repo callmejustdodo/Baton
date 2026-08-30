@@ -10,14 +10,19 @@ import stat
 import subprocess
 import tarfile
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import UUID, uuid4
 
-from .handoff import REMOTE_COMPLETION_MARKER, HandoffError, inspect_snapshot_archive
+from .handoff import (
+    REMOTE_COMPLETION_MARKER,
+    HandoffError,
+    SnapshotArchive,
+    inspect_snapshot_archive,
+)
 from .runloop import RunloopClientError, load_runloop_client, open_devbox
 from .snapshot import (
     EXCLUDED_PATH_COMPONENTS,
@@ -50,6 +55,7 @@ class HandoffReceipt:
     session_id: str
     archive: Path
     workspace: Path
+    session_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,7 @@ class FetchResult:
     changed_files: tuple[str, ...]
     remote_exit_code: int
     applied: bool
+    session_title: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -77,6 +84,7 @@ class FetchResult:
             "changed_files": list(self.changed_files),
             "remote_exit_code": self.remote_exit_code,
             "applied": self.applied,
+            "session_title": self.session_title,
         }
 
 
@@ -160,6 +168,7 @@ def fetch_workspace(
     output: Path | None = None,
     apply_changes: bool = True,
     runloop_client: Any | None = None,
+    before_apply: Callable[[FetchResult], None] | None = None,
 ) -> FetchResult:
     """Fetch a completed Devbox workspace and apply its patch by default.
 
@@ -241,6 +250,7 @@ def fetch_workspace(
             changed_files=changed_files,
             remote_exit_code=remote_exit_code,
             applied=False,
+            session_title=receipt.session_title,
         )
         should_apply = apply_changes and remote_exit_code == 0
         _write_fetch_result(
@@ -258,6 +268,42 @@ def fetch_workspace(
 
         if not should_apply:
             return result
+
+        if before_apply is not None:
+            try:
+                before_apply(result)
+            except FetchError as error:
+                try:
+                    _write_fetch_result(
+                        fetch_root / "result.json",
+                        result,
+                        receipt.session_id,
+                        applied=False,
+                        apply_status="session_preflight_failed",
+                    )
+                except OSError:
+                    pass
+                raise FetchError(
+                    "remote changes were fetched to "
+                    f"{fetch_root}, but their Codex session history failed validation; "
+                    f"the workspace was left unchanged: {error}"
+                ) from error
+            except Exception as error:
+                try:
+                    _write_fetch_result(
+                        fetch_root / "result.json",
+                        result,
+                        receipt.session_id,
+                        applied=False,
+                        apply_status="session_preflight_failed",
+                    )
+                except OSError:
+                    pass
+                raise FetchError(
+                    "remote changes were fetched to "
+                    f"{fetch_root}, but Baton's session-history preflight failed; "
+                    f"the workspace was left unchanged: {error}"
+                ) from error
 
         try:
             _apply_workspace_patch(
@@ -292,6 +338,7 @@ def fetch_workspace(
             changed_files=result.changed_files,
             remote_exit_code=result.remote_exit_code,
             applied=True,
+            session_title=result.session_title,
         )
         try:
             _write_fetch_result(
@@ -368,7 +415,38 @@ def _load_handoff_receipt(path: Path, devbox_id: str) -> HandoffReceipt:
         session_id=session_id,
         archive=snapshot.path,
         workspace=receipt_workspace,
+        session_title=_snapshot_session_title(snapshot),
     )
+
+
+def _snapshot_session_title(snapshot: SnapshotArchive) -> str | None:
+    """Read a session title from new manifests or old archived index records."""
+
+    session = snapshot.manifest.get("session")
+    if isinstance(session, Mapping):
+        title = session.get("title")
+        if isinstance(title, str) and title.strip():
+            return title
+
+    try:
+        with tarfile.open(snapshot.path, "r:gz") as archive:
+            index_file = archive.extractfile("codex/session_index.jsonl")
+            if index_file is None:
+                return None
+            title = None
+            for raw_line in index_file:
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("id") != snapshot.session_id:
+                    continue
+                candidate = record.get("thread_name")
+                if isinstance(candidate, str) and candidate.strip():
+                    title = candidate
+            return title
+    except (KeyError, OSError, tarfile.TarError, UnicodeDecodeError):
+        return None
 
 
 def _require_completion_marker(devbox: Any) -> int:
@@ -600,15 +678,69 @@ def _write_fetch_result(
     applied: bool | None,
     apply_status: str,
 ) -> None:
+    session_restore = _existing_session_restore(path)
+    payload: dict[str, object] = {
+        "session_id": session_id,
+        **result.to_dict(),
+        "applied": applied,
+        "apply_status": apply_status,
+    }
+    if session_restore is not None:
+        payload["session_restore"] = session_restore
     _write_json_atomically(
         path,
-        {
-            "session_id": session_id,
-            **result.to_dict(),
-            "applied": applied,
-            "apply_status": apply_status,
-        },
+        payload,
     )
+
+
+def record_fetch_session_restore(
+    *,
+    fetch_root: Path,
+    session_restore: Mapping[str, object],
+) -> None:
+    """Persist the outcome of restoring a fetched Codex session history.
+
+    Workspace retrieval and session restoration have separate failure modes.  The
+    artifact keeps both outcomes so a later ``baton resume`` has a clear recovery
+    path instead of treating an applied workspace as a fully restored handoff.
+    """
+
+    candidate_root = fetch_root.expanduser()
+    if candidate_root.is_symlink():
+        raise FetchError(f"fetch artifact directory is not safe: {candidate_root}")
+    root = candidate_root.resolve()
+    result_path = root / "result.json"
+    if not root.is_dir():
+        raise FetchError(f"fetch artifact directory is not safe: {root}")
+    if result_path.is_symlink() or not result_path.is_file():
+        raise FetchError(f"fetch artifact has no safe result.json: {result_path}")
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise FetchError("fetch artifact result.json is not valid JSON") from error
+    if not isinstance(payload, Mapping):
+        raise FetchError("fetch artifact result.json is invalid")
+    _write_json_atomically(
+        result_path,
+        {**payload, "session_restore": dict(session_restore)},
+    )
+
+
+def _existing_session_restore(path: Path) -> dict[str, object] | None:
+    """Keep an already-recorded preflight result when fetch updates apply status."""
+
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    session_restore = payload.get("session_restore")
+    if not isinstance(session_restore, Mapping):
+        return None
+    return dict(session_restore)
 
 
 def _apply_workspace_patch(

@@ -17,6 +17,7 @@ from baton.resume import (
     ResumeError,
     _GitState,
     _remote_git_state,
+    preflight_remote_session_restore,
     resume_remote_session,
 )
 
@@ -136,6 +137,51 @@ class ResumeTests(unittest.TestCase):
             "auth.json",
             " ".join(part for command in runloop.devbox.commands for part in command),
         )
+
+    def test_preflight_downloads_and_validates_history_without_writing_local_state(self) -> None:
+        remote_rollout = BASELINE_ROLLOUT + REMOTE_RECORD
+        runloop = _FakeRunloop({ROLLOUT_PATH: remote_rollout})
+        local_index = (self.codex_home / "session_index.jsonl").read_bytes()
+
+        preflight_remote_session_restore(
+            devbox_id=DEVBOX_ID,
+            workspace=self.workspace,
+            codex_home=self.codex_home,
+            fetch_root=self.fetch_root,
+            receipt_path=self.receipt,
+            runloop_client=runloop,
+        )
+
+        self.assertEqual(self.local_rollout.read_bytes(), BASELINE_ROLLOUT)
+        self.assertEqual((self.codex_home / "session_index.jsonl").read_bytes(), local_index)
+        self.assertTrue(runloop.devbox.filesystem.copy_calls)
+
+    def test_preflighted_history_restores_without_recontacting_the_devbox(self) -> None:
+        remote_rollout = BASELINE_ROLLOUT + REMOTE_RECORD
+        runloop = _FakeRunloop({ROLLOUT_PATH: remote_rollout})
+
+        preflight_remote_session_restore(
+            devbox_id=DEVBOX_ID,
+            workspace=self.workspace,
+            codex_home=self.codex_home,
+            fetch_root=self.fetch_root,
+            receipt_path=self.receipt,
+            runloop_client=runloop,
+        )
+        unavailable_runloop = _FakeRunloop({}, marker=None)
+
+        result = resume_remote_session(
+            devbox_id=DEVBOX_ID,
+            workspace=self.workspace,
+            codex_home=self.codex_home,
+            receipt_path=self.receipt,
+            fetch_root=self.fetch_root,
+            runloop_client=unavailable_runloop,
+        )
+
+        self.assertEqual(self.local_rollout.read_bytes(), remote_rollout)
+        self.assertEqual(result.session_id, SESSION_ID)
+        self.assertEqual(unavailable_runloop.devboxes.retrieve_calls, [])
 
     def test_remote_auth_member_is_rejected_without_changing_local_auth(self) -> None:
         runloop = _FakeRunloop(

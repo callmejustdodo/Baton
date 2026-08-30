@@ -177,7 +177,7 @@ def snapshot(
                 codex_home=source_codex_home,
                 workspace=source_workspace,
                 workspace_stats=workspace_stats,
-                session_index_included=session_index is not None,
+                session_index=session_index,
                 git_snapshot=git_snapshot,
             )
             _add_bytes(
@@ -640,7 +640,7 @@ def _manifest(
     codex_home: Path,
     workspace: Path,
     workspace_stats: WorkspaceStats,
-    session_index_included: bool,
+    session_index: bytes | None,
     git_snapshot: GitSnapshot,
 ) -> dict[str, Any]:
     resume_command = [
@@ -661,8 +661,9 @@ def _manifest(
         "created_at": datetime.now(UTC).isoformat(),
         "session": {
             "id": session_id,
+            "title": _session_title(session_index),
             "rollout_archive_path": f"codex/{rollout.relative_to(codex_home).as_posix()}",
-            "session_index_included": session_index_included,
+            "session_index_included": session_index is not None,
         },
         "workspace": {
             "archive_path": "workspace",
@@ -697,6 +698,23 @@ def _manifest(
             "native_dependency_policy": "fail rather than rebuild native dependencies",
         },
     }
+
+
+def _session_title(session_index: bytes | None) -> str | None:
+    """Return the latest non-empty thread name from a selected index record."""
+
+    if session_index is None:
+        return None
+    title: str | None = None
+    for raw_line in session_index.decode("utf-8", errors="replace").splitlines():
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        candidate = record.get("thread_name")
+        if isinstance(candidate, str) and candidate.strip():
+            title = candidate
+    return title
 
 
 def _add_bytes(archive: tarfile.TarFile, archive_path: str, contents: bytes) -> None:

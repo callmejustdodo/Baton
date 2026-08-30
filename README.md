@@ -2,7 +2,7 @@
 
 We need to keep our MacBook open in agent era. **Before Baton.**
 
-> Hand an in-progress Codex session to a [Runloop Devbox](https://docs.runloop.ai/docs/devboxes/overview), close the laptop, then fetch the finished work and conversation.
+> **One-line description:** Baton hands an in-progress Codex session to a [Runloop Devbox](https://docs.runloop.ai/docs/devboxes/overview), so you can close your MacBook and pick up the finished work and conversation later.
 
 ![A laptop hands off an in-progress agent session to the cloud](assets/baton-handoff.png)
 
@@ -10,7 +10,11 @@ We need to keep our MacBook open in agent era. **Before Baton.**
 | --- | --- |
 | Keep your MacBook open until Codex finishes. | Hand off the session, close the laptop, and pick up later. |
 
-Baton is a checkpoint-and-handoff tool, not a live terminal connection or a PR bot. It snapshots one selected Codex rollout, workspace, and Git state; restores them in a Linux x86_64 Runloop Devbox; and runs Codex non-interactively with `codex exec resume`.
+## Project description
+
+Baton is an open-source CLI for checkpointing an in-progress Codex session and continuing it in a Linux x86_64 Runloop Devbox. It packages the selected Codex rollout, workspace, and Git state; resumes Codex non-interactively in the cloud; then fetches both the completed files and conversation back to the laptop.
+
+It is a checkpoint-and-handoff tool, not a live terminal connection or a PR bot: treat each handoff as a takeover point, and do not continue the same session or edit the same workspace locally and remotely at once.
 
 ## How it works
 
@@ -49,8 +53,8 @@ Choose the session with ↑/↓ and Enter, then close your MacBook. When you ret
 to the same project, collect the work and conversation:
 
 ```bash
-baton fetch   # safely auto-applies changes when the local baseline still matches
-baton resume  # restores the completed Codex conversation locally
+baton fetch   # safely applies changes and restores the completed conversation
+baton resume  # later reopen or re-restore that conversation explicitly
 ```
 
 Use `baton fetch --no-apply` when you want to review the downloaded patch before
@@ -117,10 +121,11 @@ Choose the detached handoff. Baton always writes a review artifact:
 ├── baseline/       # workspace at handoff time
 ├── workspace/      # workspace after remote Codex work
 ├── changes.patch   # binary-safe baseline → remote diff
+├── session-history/ # verified rollout and selected index record
 └── result.json     # Devbox/session metadata and Codex exit code
 ```
 
-By default Baton applies the fetched patch to the current workspace. Before it does, it verifies the portable source files—and, for Git projects, checkout and index—still match the handoff baseline. If they do not, Baton leaves the artifact in place and does not overwrite anything. Baton never creates a commit, pushes, or opens a PR.
+By default Baton applies the fetched patch to the current workspace. Before it does, it verifies the portable source files—and, for Git projects, checkout and index—still match the handoff baseline, then stages and validates the remote Codex rollout plus matching session-index record inside the fetch artifact. After a successful apply, it restores that local staged history into `CODEX_HOME` without opening the Codex TUI, so the final restore does not need a second Devbox download. The command's JSON reports the restored session ID, rollout path, and any backup paths under `session_restore`. If the workspace cannot be applied, Baton does not restore the conversation. Baton never creates a commit, pushes, or opens a PR.
 
 Use review-only mode when you do not want local files changed:
 
@@ -130,13 +135,13 @@ baton fetch --no-apply
 
 ### 4. Restore the conversation
 
-After a successful fetch that applied its patch, restore the remote conversation locally:
+To explicitly re-restore the remote conversation and open it in Codex later, run:
 
 ```bash
 baton resume
 ```
 
-Baton downloads only the selected rollout and matching session-index record, verifies that it extends the immutable handoff snapshot, backs up the local record under `.baton/session-backups/`, and starts `codex resume <session-id>` using local `CODEX_HOME`.
+Baton downloads only the selected rollout and matching session-index record, verifies that it extends the immutable handoff snapshot, backs up the local record under `.baton/session-backups/`, and starts `codex resume <session-id>` using local `CODEX_HOME`. This command remains useful after `baton fetch` because fetch restores history without launching the TUI.
 
 It never downloads the Devbox's `auth.json`, global databases, plugins, logs, or other Codex runtime state. Use `baton resume --no-launch` to restore without opening the local TUI.
 
@@ -149,7 +154,7 @@ Add `.baton/` to the target project's `.gitignore`: snapshots contain source and
 | `baton prepare` | Build a Runloop Blueprint with Codex and Git. |
 | `baton handoff` | Snapshot a session and continue it in a Runloop Devbox. |
 | `baton snapshot` | Create a local archive without starting remote work. |
-| `baton fetch` | Download a completed Devbox workspace and safely apply its changes. |
+| `baton fetch` | Download and apply completed work, then restore its Codex conversation locally. |
 | `baton resume` | Restore a completed remote Codex conversation locally. |
 
 Useful handoff options:

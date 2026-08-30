@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,8 +10,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from baton.cli import build_parser, main
-from baton.fetch import HandoffReceipt
+from baton.fetch import FetchError, HandoffReceipt
 from baton.picker import PickerCancelled, SessionChoice
+from baton.resume import ResumeError
 
 SESSION_ID = "019f5ef4-780a-7973-a1d2-c460461ced1f"
 DEVBOX_ID = "devbox-picker-test"
@@ -31,7 +33,12 @@ class CliPickerTests(unittest.TestCase):
             session_id=SESSION_ID,
             to_dict=lambda: {"devbox_id": DEVBOX_ID},
         )
-        self.fetch_result = SimpleNamespace(to_dict=lambda: {"devbox_id": DEVBOX_ID})
+        self.fetch_result = SimpleNamespace(
+            applied=False,
+            remote_exit_code=0,
+            fetch_root=self.workspace / ".baton/fetches" / DEVBOX_ID,
+            to_dict=lambda: {"devbox_id": DEVBOX_ID},
+        )
         self.resume_result = SimpleNamespace(
             local_exit_code=None,
             to_dict=lambda: {"devbox_id": DEVBOX_ID, "session_id": SESSION_ID},
@@ -44,6 +51,52 @@ class CliPickerTests(unittest.TestCase):
         args = build_parser().parse_args(["handoff", "continue working"])
 
         self.assertEqual(args.secret_name, "BATON_OPENAI_API_KEY")
+
+    def test_prepare_runs_inside_loading_indicator(self) -> None:
+        events: list[str] = []
+
+        class _Indicator:
+            def __init__(self, message: str) -> None:
+                self.message = message
+
+            def __enter__(self) -> None:
+                events.append(f"start:{self.message}")
+
+            def __exit__(self, *args: object) -> None:
+                events.append("stop")
+
+        def prepare_runtime(**kwargs: object) -> SimpleNamespace:
+            events.append("prepare")
+            return SimpleNamespace(to_dict=lambda: kwargs)
+
+        with (
+            patch("baton.cli.TerminalSpinner", _Indicator),
+            patch("baton.cli.prepare_runtime", side_effect=prepare_runtime),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main(["prepare", "--codex-version", "0.151.0"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            events,
+            ["start:Preparing Runloop runtime...", "prepare", "stop"],
+        )
+
+    def test_prepare_keeps_redirected_output_machine_readable(self) -> None:
+        result = SimpleNamespace(to_dict=lambda: {"blueprint": "baton-test"})
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch("baton.cli.prepare_runtime", return_value=result),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = main(["prepare", "--codex-version", "0.151.0"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {"blueprint": "baton-test"})
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_handoff_rejects_invalid_runloop_secret_name(self) -> None:
         with (
@@ -90,6 +143,44 @@ class CliPickerTests(unittest.TestCase):
         self.assertEqual(handoff_mock.call_args.kwargs["idle_suspend_seconds"], 300)
         sessions_mock.assert_not_called()
         picker_mock.assert_not_called()
+
+    def test_handoff_runs_snapshot_and_remote_work_inside_loading_indicator(self) -> None:
+        events: list[str] = []
+
+        class _Indicator:
+            def __init__(self, message: str) -> None:
+                self.message = message
+
+            def __enter__(self) -> None:
+                events.append(f"start:{self.message}")
+
+            def __exit__(self, *args: object) -> None:
+                events.append("stop")
+
+        with (
+            patch("baton.cli.TerminalSpinner", _Indicator),
+            patch(
+                "baton.cli.snapshot",
+                side_effect=lambda **kwargs: (
+                    events.append("snapshot") or self.snapshot_result
+                ),
+            ),
+            patch(
+                "baton.cli.handoff_archive",
+                side_effect=lambda **kwargs: (
+                    events.append("handoff") or self.handoff_result
+                ),
+            ),
+            patch("baton.cli.infer_local_codex_version", return_value="0.147.0"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main(["handoff", SESSION_ID, "continue working"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            events,
+            ["start:Handing off Codex session...", "snapshot", "handoff", "stop"],
+        )
 
     def test_handoff_prompt_only_selects_a_session(self) -> None:
         selected = self._session_choice()
@@ -151,6 +242,185 @@ class CliPickerTests(unittest.TestCase):
         self.assertTrue(fetch_mock.call_args.kwargs["apply_changes"])
         receipts_mock.assert_not_called()
         picker_mock.assert_not_called()
+
+    def test_fetch_runs_remote_work_inside_loading_indicator(self) -> None:
+        events: list[str] = []
+
+        class _Indicator:
+            def __init__(self, message: str) -> None:
+                self.message = message
+
+            def __enter__(self) -> None:
+                events.append(f"start:{self.message}")
+
+            def __exit__(self, *args: object) -> None:
+                events.append("stop")
+
+        with (
+            patch("baton.cli.TerminalSpinner", _Indicator),
+            patch(
+                "baton.cli.fetch_workspace",
+                side_effect=lambda **kwargs: (
+                    events.append("fetch") or self.fetch_result
+                ),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = main(["fetch", DEVBOX_ID])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            events,
+            ["start:Fetching remote changes...", "fetch", "stop"],
+        )
+
+    def test_successful_fetch_restores_session_without_launching_codex(self) -> None:
+        fetch_result = SimpleNamespace(
+            applied=True,
+            remote_exit_code=0,
+            fetch_root=self.workspace / ".baton/fetches" / DEVBOX_ID,
+            to_dict=lambda: {"devbox_id": DEVBOX_ID, "applied": True},
+        )
+        stdout = io.StringIO()
+        with (
+            patch("baton.cli.fetch_workspace", return_value=fetch_result),
+            patch(
+                "baton.cli.resume_remote_session",
+                return_value=self.resume_result,
+            ) as resume_mock,
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = main(
+                [
+                    "fetch",
+                    DEVBOX_ID,
+                    "--workspace",
+                    str(self.workspace),
+                    "--codex-home",
+                    str(self.codex_home),
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        resume_mock.assert_called_once_with(
+            devbox_id=DEVBOX_ID,
+            workspace=self.workspace,
+            codex_home=self.codex_home,
+            receipt_path=None,
+            fetch_root=fetch_result.fetch_root,
+            launch=False,
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["session_restore"]["status"], "restored")
+        self.assertEqual(payload["session_restore"]["session_id"], SESSION_ID)
+
+    def test_fetch_no_apply_reports_session_restore_skipped(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch("baton.cli.fetch_workspace", return_value=self.fetch_result),
+            patch("baton.cli.resume_remote_session") as resume_mock,
+            patch("baton.cli.record_fetch_session_restore"),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = main(
+                ["fetch", DEVBOX_ID, "--workspace", str(self.workspace), "--no-apply"]
+            )
+
+        self.assertEqual(exit_code, 0)
+        resume_mock.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["session_restore"],
+            {"status": "skipped", "reason": "review_only"},
+        )
+
+    def test_failed_remote_fetch_reports_session_restore_skipped(self) -> None:
+        fetch_result = SimpleNamespace(
+            applied=False,
+            remote_exit_code=2,
+            fetch_root=self.workspace / ".baton/fetches" / DEVBOX_ID,
+            to_dict=lambda: {
+                "devbox_id": DEVBOX_ID,
+                "applied": False,
+                "remote_exit_code": 2,
+            },
+        )
+        stdout = io.StringIO()
+        with (
+            patch("baton.cli.fetch_workspace", return_value=fetch_result),
+            patch("baton.cli.resume_remote_session") as resume_mock,
+            patch("baton.cli.record_fetch_session_restore"),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = main(["fetch", DEVBOX_ID, "--workspace", str(self.workspace)])
+
+        self.assertEqual(exit_code, 0)
+        resume_mock.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["session_restore"],
+            {"status": "skipped", "reason": "remote_exit_nonzero"},
+        )
+
+    def test_fetch_records_partial_success_when_session_history_is_unsafe(self) -> None:
+        fetch_result = SimpleNamespace(
+            applied=True,
+            remote_exit_code=0,
+            fetch_root=self.workspace / ".baton/fetches" / DEVBOX_ID,
+            to_dict=lambda: {"devbox_id": DEVBOX_ID, "applied": True},
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch("baton.cli.fetch_workspace", return_value=fetch_result),
+            patch(
+                "baton.cli.resume_remote_session",
+                side_effect=ResumeError("remote rollout is unsafe"),
+            ),
+            patch("baton.cli.record_fetch_session_restore") as record_mock,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = main(["fetch", DEVBOX_ID, "--workspace", str(self.workspace)])
+
+        self.assertEqual(exit_code, 1)
+        record_mock.assert_called_once()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["session_restore"]["status"], "failed")
+        self.assertEqual(payload["session_restore"]["phase"], "restore")
+        self.assertEqual(payload["session_restore"]["error"], "remote rollout is unsafe")
+        self.assertIn("workspace changes were applied", stderr.getvalue())
+        self.assertIn("session history was not restored", stderr.getvalue())
+
+    def test_partial_fetch_does_not_claim_a_failed_record_was_persisted(self) -> None:
+        fetch_result = SimpleNamespace(
+            applied=True,
+            remote_exit_code=0,
+            fetch_root=self.workspace / ".baton/fetches" / DEVBOX_ID,
+            to_dict=lambda: {"devbox_id": DEVBOX_ID, "applied": True},
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch("baton.cli.fetch_workspace", return_value=fetch_result),
+            patch(
+                "baton.cli.resume_remote_session",
+                side_effect=ResumeError("remote rollout is unsafe"),
+            ),
+            patch(
+                "baton.cli.record_fetch_session_restore",
+                side_effect=FetchError("disk full"),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = main(["fetch", DEVBOX_ID, "--workspace", str(self.workspace)])
+
+        self.assertEqual(exit_code, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["session_restore"]["record_error"], "disk full")
+        self.assertIn("could not update the fetch artifact", stderr.getvalue())
+        self.assertNotIn("saved fetch artifact records", stderr.getvalue())
 
     def test_fetch_no_apply_keeps_review_only_mode(self) -> None:
         with (
